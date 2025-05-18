@@ -552,31 +552,48 @@ impl Message {
     ///
     /// Returns `None` if the message is not in a forum topic or the topic ID is not available.
     pub fn topic_id(&self) -> Option<i32> {
-        match &self.raw.reply_to {
-            Some(header) => {
-                let (forum_topic, reply_to_top_id, reply_to_msg_id) = match header {
-                    tl::enums::MessageReplyHeader::Header(m) => 
-                        (m.forum_topic, m.reply_to_top_id, m.reply_to_msg_id),
-                    tl::enums::MessageReplyHeader::MessageReplyHeader(m) => 
-                        (m.forum_topic, m.reply_to_top_id, m.reply_to_msg_id),
-                    _ => (false, None, None),
-                };
-
-                // If this is a forum topic message
-                if forum_topic {
-                    // First try to use reply_to_top_id if available
-                    if let Some(top_id) = reply_to_top_id {
-                        return Some(top_id);
-                    }
-                    
-                    // Fall back to reply_to_msg_id which is often the topic ID
-                    // for the initial message in a topic
-                    return reply_to_msg_id;
-                }
-                None
-            }
-            _ => None,
+        // First check if this is a forum topic message
+        let is_forum = match &self.raw.reply_to {
+            Some(header) => match header {
+                tl::enums::MessageReplyHeader::Header(m) => m.forum_topic,
+                tl::enums::MessageReplyHeader::MessageReplyHeader(m) => m.forum_topic,
+                _ => false,
+            },
+            _ => false,
+        };
+        
+        if !is_forum {
+            return None;
         }
+        
+        // For forum topic messages, try multiple approaches to get the topic ID
+        
+        // 1. Try reply_to_top_id from the reply header
+        if let Some(header) = &self.raw.reply_to {
+            match header {
+                tl::enums::MessageReplyHeader::Header(m) if m.reply_to_top_id.is_some() => {
+                    return m.reply_to_top_id;
+                },
+                tl::enums::MessageReplyHeader::MessageReplyHeader(m) if m.reply_to_top_id.is_some() => {
+                    return m.reply_to_top_id;
+                },
+                _ => {}
+            }
+        }
+        
+        // 2. Try reply_to_message_id from the reply header
+        if let Some(reply_id) = self.reply_to_message_id() {
+            return Some(reply_id);
+        }
+        
+        // 3. If the message itself has ID <= 10, it might be a topic message (topic IDs are typically small numbers)
+        // This is a heuristic approach based on observed behavior
+        if self.raw.id <= 10 {
+            return Some(self.raw.id);
+        }
+        
+        // If all approaches fail, we can't determine the topic ID
+        None
     }
     
     /// Check if this message belongs to a specific topic ID.
