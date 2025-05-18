@@ -546,13 +546,35 @@ impl Message {
     /// If this message is in a forum topic, return the topic ID.
     ///
     /// This method extracts the topic ID from the message's reply header.
-    /// The topic ID is available in the `reply_to_top_id` field of the MessageReplyHeader.
+    /// The topic ID should be in the `reply_to_top_id` field, but in some cases
+    /// Telegram may use `reply_to_msg_id` for the topic ID, especially for the
+    /// initial message in a topic.
     ///
     /// Returns `None` if the message is not in a forum topic or the topic ID is not available.
     pub fn topic_id(&self) -> Option<i32> {
         match &self.raw.reply_to {
-            Some(tl::enums::MessageReplyHeader::Header(m)) => m.reply_to_top_id,
-            Some(tl::enums::MessageReplyHeader::MessageReplyHeader(m)) => m.reply_to_top_id,
+            Some(header) => {
+                let (forum_topic, reply_to_top_id, reply_to_msg_id) = match header {
+                    tl::enums::MessageReplyHeader::Header(m) => 
+                        (m.forum_topic, m.reply_to_top_id, m.reply_to_msg_id),
+                    tl::enums::MessageReplyHeader::MessageReplyHeader(m) => 
+                        (m.forum_topic, m.reply_to_top_id, m.reply_to_msg_id),
+                    _ => (false, None, None),
+                };
+
+                // If this is a forum topic message
+                if forum_topic {
+                    // First try to use reply_to_top_id if available
+                    if let Some(top_id) = reply_to_top_id {
+                        return Some(top_id);
+                    }
+                    
+                    // Fall back to reply_to_msg_id which is often the topic ID
+                    // for the initial message in a topic
+                    return reply_to_msg_id;
+                }
+                None
+            }
             _ => None,
         }
     }
@@ -574,6 +596,49 @@ impl Message {
         match self.topic_id() {
             Some(id) => topic_ids.contains(&id),
             None => false,
+        }
+    }
+    
+    /// Returns detailed information about the topic status of this message.
+    ///
+    /// This method is useful for debugging and understanding how Telegram is structuring
+    /// forum topic information in messages.
+    pub fn debug_topic_info(&self) -> String {
+        match &self.raw.reply_to {
+            Some(header) => {
+                let (variant, forum_topic, reply_to_top_id, reply_to_msg_id) = match header {
+                    tl::enums::MessageReplyHeader::Header(m) => 
+                        ("Header", m.forum_topic, m.reply_to_top_id, m.reply_to_msg_id),
+                    tl::enums::MessageReplyHeader::MessageReplyHeader(m) => 
+                        ("MessageReplyHeader", m.forum_topic, m.reply_to_top_id, m.reply_to_msg_id),
+                    _ => ("Unknown", false, None, None),
+                };
+                
+                let is_in_forum = if let Some(chat) = self.chat().as_channel() {
+                    chat.is_forum()
+                } else {
+                    false
+                };
+                
+                format!(
+                    "Topic Debug Info:\n\
+                     - Message ID: {}\n\
+                     - Chat is forum-enabled: {}\n\
+                     - Reply header variant: {}\n\
+                     - forum_topic flag: {}\n\
+                     - reply_to_top_id: {:?}\n\
+                     - reply_to_msg_id: {:?}\n\
+                     - topic_id() returns: {:?}",
+                    self.raw.id,
+                    is_in_forum,
+                    variant,
+                    forum_topic,
+                    reply_to_top_id,
+                    reply_to_msg_id,
+                    self.topic_id()
+                )
+            },
+            None => "No reply header found".to_string(),
         }
     }
 

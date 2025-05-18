@@ -183,6 +183,14 @@ impl Channel {
             None => None,
         }
     }
+    
+    /// Return whether this channel has forums enabled.
+    ///
+    /// Forums are a feature that allows organizing conversations into topics.
+    /// This will return true for supergroups (megagroups) with the forum flag set.
+    pub fn is_forum(&self) -> bool {
+        self.raw.forum
+    }
 }
 
 impl From<Channel> for PackedChat {
