@@ -523,28 +523,57 @@ impl Message {
 
     /// If this message is replying to another message, return the replied message ID.
     pub fn reply_to_message_id(&self) -> Option<i32> {
-        if let Some(tl::enums::MessageReplyHeader::Header(m)) = &self.raw.reply_to {
-            m.reply_to_msg_id
-        } else {
-            None
+        match &self.raw.reply_to {
+            Some(tl::enums::MessageReplyHeader::Header(m)) => m.reply_to_msg_id,
+            Some(tl::enums::MessageReplyHeader::MessageReplyHeader(m)) => m.reply_to_msg_id,
+            _ => None,
         }
     }
     
     /// If this message is in a forum topic, return whether it's a forum topic message.
+    ///
+    /// This method checks the `forum_topic` flag in the message's reply header.
+    /// Forum topics are a Telegram feature that allows organizing conversations into topics
+    /// within a group or channel.
     pub fn is_forum_topic(&self) -> bool {
-        if let Some(tl::enums::MessageReplyHeader::Header(m)) = &self.raw.reply_to {
-            m.forum_topic
-        } else {
-            false
+        match &self.raw.reply_to {
+            Some(tl::enums::MessageReplyHeader::Header(m)) => m.forum_topic,
+            Some(tl::enums::MessageReplyHeader::MessageReplyHeader(m)) => m.forum_topic,
+            _ => false,
         }
     }
 
     /// If this message is in a forum topic, return the topic ID.
+    ///
+    /// This method extracts the topic ID from the message's reply header.
+    /// The topic ID is available in the `reply_to_top_id` field of the MessageReplyHeader.
+    ///
+    /// Returns `None` if the message is not in a forum topic or the topic ID is not available.
     pub fn topic_id(&self) -> Option<i32> {
-        if let Some(tl::enums::MessageReplyHeader::Header(m)) = &self.raw.reply_to {
-            m.reply_to_top_id
-        } else {
-            None
+        match &self.raw.reply_to {
+            Some(tl::enums::MessageReplyHeader::Header(m)) => m.reply_to_top_id,
+            Some(tl::enums::MessageReplyHeader::MessageReplyHeader(m)) => m.reply_to_top_id,
+            _ => None,
+        }
+    }
+    
+    /// Check if this message belongs to a specific topic ID.
+    /// 
+    /// This is useful for filtering messages by topic.
+    pub fn is_in_topic(&self, topic_id: i32) -> bool {
+        match self.topic_id() {
+            Some(id) => id == topic_id,
+            None => false,
+        }
+    }
+    
+    /// Check if this message belongs to any of the specified topic IDs.
+    /// 
+    /// This is useful for filtering messages by multiple topics.
+    pub fn is_in_topics(&self, topic_ids: &[i32]) -> bool {
+        match self.topic_id() {
+            Some(id) => topic_ids.contains(&id),
+            None => false,
         }
     }
 
