@@ -529,6 +529,24 @@ impl Message {
             None
         }
     }
+    
+    /// If this message is in a forum topic, return whether it's a forum topic message.
+    pub fn is_forum_topic(&self) -> bool {
+        if let Some(tl::enums::MessageReplyHeader::Header(m)) = &self.raw.reply_to {
+            m.forum_topic
+        } else {
+            false
+        }
+    }
+
+    /// If this message is in a forum topic, return the topic ID.
+    pub fn topic_id(&self) -> Option<i32> {
+        if let Some(tl::enums::MessageReplyHeader::Header(m)) = &self.raw.reply_to {
+            m.reply_to_top_id
+        } else {
+            None
+        }
+    }
 
     /// Fetch the message that this message is replying to, or `None` if this message is not a
     /// reply to a previous message.
