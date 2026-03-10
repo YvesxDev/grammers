@@ -62,6 +62,7 @@ impl MessageBox {
             getting_diff_for: HashSet::new(),
             next_deadline: None,
             tmp_entries: HashSet::new(),
+            pending_during_diff: HashMap::new(),
         }
     }
 
@@ -118,6 +119,7 @@ impl MessageBox {
             getting_diff_for,
             next_deadline: Some(Entry::AccountWide),
             tmp_entries: HashSet::new(),
+            pending_during_diff: HashMap::new(),
         }
     }
 
@@ -340,16 +342,36 @@ impl MessageBox {
 
     /// Finish getting difference for the given entry.
     ///
-    /// It also resets the deadline.
-    fn end_get_diff(&mut self, entry: Entry) {
+    /// It also resets the deadline and replays any updates that were buffered
+    /// while getDifference was in progress.
+    fn end_get_diff(&mut self, entry: Entry) -> Vec<tl::enums::Update> {
         if !self.getting_diff_for.remove(&entry) {
             panic!("Called end_get_diff on an entry which was not getting diff for");
         };
         self.reset_deadline(entry, next_updates_deadline());
-        assert!(
-            !self.possible_gaps.contains_key(&entry),
-            "gaps shouldn't be created while getting difference"
-        );
+
+        // Replay updates that arrived during getDifference.
+        // Now that getDifference is complete and pts is updated, these updates
+        // can be properly evaluated: duplicates will be skipped, valid ones applied,
+        // and any remaining gaps handled normally.
+        let mut result = Vec::new();
+        if let Some(buffered) = self.pending_during_diff.remove(&entry) {
+            if !buffered.is_empty() {
+                debug!(
+                    "replaying {} buffered updates for {:?} after getDifference",
+                    buffered.len(),
+                    entry
+                );
+                for update in buffered {
+                    let (_, applied) = self.apply_pts_info(update);
+                    if let Some(update) = applied {
+                        result.push(update);
+                    }
+                }
+            }
+        }
+
+        result
     }
 }
 
@@ -366,37 +388,18 @@ impl MessageBox {
         updates: &tl::enums::Updates,
         chat_hashes: &mut ChatHashCache,
     ) -> Result<(), Gap> {
-        // In essence, "min constructors suck".
-        // Apparently, TDLib just does `getDifference` if encounters non-cached min peers.
-        // So rather than using the `inputPeer*FromMessage` (which not only are considerably
-        // larger but may need to be nested, and may stop working if the message is gone),
-        // just treat it as a gap when encountering peers for which the hash is not known.
-        // Context: https://t.me/tdlibchat/15096.
-        if chat_hashes.extend_from_updates(updates) {
-            Ok(())
-        } else {
-            // However, some updates do not change the pts, so attempting to recover the gap
-            // will just result in an empty result from `getDifference` (being just wasteful).
-            // Check if this update has any pts we can try to recover from.
-            let can_recover = match updates {
-                tl::enums::Updates::TooLong => true,
-                tl::enums::Updates::UpdateShortMessage(_) => true,
-                tl::enums::Updates::UpdateShortChatMessage(_) => true,
-                tl::enums::Updates::UpdateShort(u) => PtsInfo::from_update(&u.update).is_some(),
-                tl::enums::Updates::Combined(_) => true,
-                tl::enums::Updates::Updates(_) => true,
-                tl::enums::Updates::UpdateShortSentMessage(_) => true,
-            };
-
-            if can_recover {
-                info!("received an update referencing an unknown peer, treating as gap");
-                self.try_begin_get_diff(Entry::AccountWide);
-                Err(Gap)
-            } else {
-                info!("received an update referencing an unknown peer, but cannot find out who");
-                Ok(())
-            }
+        // Try to extend hashes from the update. If some peers have min constructors
+        // without cached access hashes, we proceed anyway instead of triggering
+        // getDifference. This prevents cascading gap recovery cycles that cause
+        // message loss in active channels with many unique senders.
+        //
+        // The message content (text, chat_id, etc.) is still fully available even
+        // when some referenced peers lack access hashes. Access hashes are only
+        // needed for API calls to interact with those peers.
+        if !chat_hashes.extend_from_updates(updates) {
+            info!("received an update referencing an unknown peer; proceeding without triggering getDifference");
         }
+        Ok(())
     }
 
     /// Process an update and return what should be done with it.
@@ -564,11 +567,16 @@ impl MessageBox {
 
         if self.getting_diff_for.contains(&pts.entry) {
             debug!(
-                "skipping update for {:?} (getting difference, count {:?}, remote {:?})",
+                "buffering update for {:?} during getDifference (count {:?}, remote {:?})",
                 pts.entry, pts.pts_count, pts.pts
             );
-            // Note: early returning here also prevents gap from being inserted (which they should
-            // not be while getting difference).
+            // Buffer the update for replay after getDifference completes, instead of
+            // silently dropping it. If getDifference returns TooLong, these buffered
+            // updates would otherwise be permanently lost.
+            self.pending_during_diff
+                .entry(pts.entry)
+                .or_insert_with(Vec::new)
+                .push(update);
             return (Some(pts.entry), None);
         }
 
@@ -658,7 +666,7 @@ impl MessageBox {
     ) -> defs::UpdateAndPeers {
         trace!("applying account difference: {:?}", difference);
         let finish: bool;
-        let result = match difference {
+        let mut result = match difference {
             tl::enums::updates::Difference::Empty(diff) => {
                 debug!(
                     "handling empty difference (date = {}, seq = {}); no longer getting diff",
@@ -706,8 +714,8 @@ impl MessageBox {
                 )
             }
             tl::enums::updates::Difference::TooLong(diff) => {
-                debug!(
-                    "handling too-long difference (pts = {}); no longer getting diff",
+                warn!(
+                    "handling too-long difference (pts = {}); fast-forwarding pts, some messages may be lost",
                     diff.pts
                 );
                 finish = true;
@@ -728,10 +736,12 @@ impl MessageBox {
             }
 
             if account {
-                self.end_get_diff(Entry::AccountWide);
+                let replayed = self.end_get_diff(Entry::AccountWide);
+                result.0.extend(replayed);
             }
             if secret {
-                self.end_get_diff(Entry::SecretChats);
+                let replayed = self.end_get_diff(Entry::SecretChats);
+                result.0.extend(replayed);
             }
         }
 
@@ -880,12 +890,11 @@ impl MessageBox {
                     "handling empty channel {} difference (pts = {}); no longer getting diff",
                     channel_id, diff.pts
                 );
-                self.end_get_diff(entry);
+                let replayed = self.end_get_diff(entry);
                 self.map.get_mut(&entry).unwrap().pts = diff.pts;
-                (Vec::new(), Vec::new(), Vec::new())
+                (replayed, Vec::new(), Vec::new())
             }
             tl::enums::updates::ChannelDifference::TooLong(diff) => {
-                // TODO return Err(attempt to find users)
                 let _ = chat_hashes.extend(&diff.users, &diff.chats);
 
                 assert!(diff.r#final);
@@ -904,11 +913,27 @@ impl MessageBox {
                     }
                 }
 
+                // End getDifference and replay buffered updates
+                let replayed = self.end_get_diff(entry);
                 self.reset_channel_deadline(channel_id, diff.timeout);
-                // This `diff` has the "latest messages and corresponding chats", but it would
-                // be strange to give the user only partial changes of these when they would
-                // expect all updates to be fetched. Instead, nothing is returned.
-                (Vec::new(), Vec::new(), Vec::new())
+
+                // Return available messages from the TooLong response instead of
+                // silently dropping them all. These are the "latest messages" that
+                // Telegram provides even when the full difference is too large.
+                let mut result_updates: Vec<tl::enums::Update> = diff
+                    .messages
+                    .into_iter()
+                    .map(|message| {
+                        tl::types::UpdateNewChannelMessage {
+                            message,
+                            pts: NO_PTS,
+                            pts_count: 0,
+                        }
+                        .into()
+                    })
+                    .collect();
+                result_updates.extend(replayed);
+                (result_updates, diff.users, diff.chats)
             }
             tl::enums::updates::ChannelDifference::Difference(
                 tl::types::updates::ChannelDifference {
@@ -921,7 +946,6 @@ impl MessageBox {
                     users,
                 },
             ) => {
-                // TODO return Err(attempt to find users)
                 let _ = chat_hashes.extend(&users, &chats);
 
                 if r#final {
@@ -929,34 +953,59 @@ impl MessageBox {
                         "handling channel {} difference; no longer getting diff",
                         channel_id
                     );
-                    self.end_get_diff(entry);
+                    let replayed = self.end_get_diff(entry);
+
+                    self.map.get_mut(&entry).unwrap().pts = pts;
+                    let us = tl::enums::Updates::Updates(tl::types::Updates {
+                        updates,
+                        users,
+                        chats,
+                        date: NO_DATE,
+                        seq: NO_SEQ,
+                    });
+                    let (mut result_updates, users, chats) = self
+                        .process_updates(us, chat_hashes)
+                        .expect("gap is detected while applying channel difference");
+
+                    result_updates.extend(new_messages.into_iter().map(|message| {
+                        tl::types::UpdateNewChannelMessage {
+                            message,
+                            pts: NO_PTS,
+                            pts_count: 0,
+                        }
+                        .into()
+                    }));
+                    result_updates.extend(replayed);
+                    self.reset_channel_deadline(channel_id, timeout);
+
+                    (result_updates, users, chats)
                 } else {
                     debug!("handling channel {} difference", channel_id);
+
+                    self.map.get_mut(&entry).unwrap().pts = pts;
+                    let us = tl::enums::Updates::Updates(tl::types::Updates {
+                        updates,
+                        users,
+                        chats,
+                        date: NO_DATE,
+                        seq: NO_SEQ,
+                    });
+                    let (mut result_updates, users, chats) = self
+                        .process_updates(us, chat_hashes)
+                        .expect("gap is detected while applying channel difference");
+
+                    result_updates.extend(new_messages.into_iter().map(|message| {
+                        tl::types::UpdateNewChannelMessage {
+                            message,
+                            pts: NO_PTS,
+                            pts_count: 0,
+                        }
+                        .into()
+                    }));
+                    self.reset_channel_deadline(channel_id, timeout);
+
+                    (result_updates, users, chats)
                 }
-
-                self.map.get_mut(&entry).unwrap().pts = pts;
-                let us = tl::enums::Updates::Updates(tl::types::Updates {
-                    updates,
-                    users,
-                    chats,
-                    date: NO_DATE,
-                    seq: NO_SEQ,
-                });
-                let (mut result_updates, users, chats) = self
-                    .process_updates(us, chat_hashes)
-                    .expect("gap is detected while applying channel difference");
-
-                result_updates.extend(new_messages.into_iter().map(|message| {
-                    tl::types::UpdateNewChannelMessage {
-                        message,
-                        pts: NO_PTS,
-                        pts_count: 0,
-                    }
-                    .into()
-                }));
-                self.reset_channel_deadline(channel_id, timeout);
-
-                (result_updates, users, chats)
             }
         }
     }
@@ -975,11 +1024,12 @@ impl MessageBox {
             match reason {
                 PrematureEndReason::TemporaryServerIssues => {
                     self.possible_gaps.remove(&entry);
-                    self.end_get_diff(entry);
+                    // Discard replayed updates on error — they can't be delivered without context
+                    let _ = self.end_get_diff(entry);
                 }
                 PrematureEndReason::Banned => {
                     self.possible_gaps.remove(&entry);
-                    self.end_get_diff(entry);
+                    let _ = self.end_get_diff(entry);
                     self.map.remove(&entry);
                 }
             }

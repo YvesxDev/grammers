@@ -525,7 +525,6 @@ impl Message {
     pub fn reply_to_message_id(&self) -> Option<i32> {
         match &self.raw.reply_to {
             Some(tl::enums::MessageReplyHeader::Header(m)) => m.reply_to_msg_id,
-            Some(tl::enums::MessageReplyHeader::MessageReplyHeader(m)) => m.reply_to_msg_id,
             _ => None,
         }
     }
@@ -538,7 +537,6 @@ impl Message {
     pub fn is_forum_topic(&self) -> bool {
         match &self.raw.reply_to {
             Some(tl::enums::MessageReplyHeader::Header(m)) => m.forum_topic,
-            Some(tl::enums::MessageReplyHeader::MessageReplyHeader(m)) => m.forum_topic,
             _ => false,
         }
     }
@@ -554,27 +552,20 @@ impl Message {
     pub fn topic_id(&self) -> Option<i32> {
         // First check if this is a forum topic message
         let is_forum = match &self.raw.reply_to {
-            Some(header) => match header {
-                tl::enums::MessageReplyHeader::Header(m) => m.forum_topic,
-                tl::enums::MessageReplyHeader::MessageReplyHeader(m) => m.forum_topic,
-                _ => false,
-            },
+            Some(tl::enums::MessageReplyHeader::Header(m)) => m.forum_topic,
             _ => false,
         };
-        
+
         if !is_forum {
             return None;
         }
-        
+
         // For forum topic messages, try multiple approaches to get the topic ID
-        
+
         // 1. Try reply_to_top_id from the reply header
         if let Some(header) = &self.raw.reply_to {
             match header {
                 tl::enums::MessageReplyHeader::Header(m) if m.reply_to_top_id.is_some() => {
-                    return m.reply_to_top_id;
-                },
-                tl::enums::MessageReplyHeader::MessageReplyHeader(m) if m.reply_to_top_id.is_some() => {
                     return m.reply_to_top_id;
                 },
                 _ => {}
@@ -624,30 +615,20 @@ impl Message {
         match &self.raw.reply_to {
             Some(header) => {
                 let (variant, forum_topic, reply_to_top_id, reply_to_msg_id) = match header {
-                    tl::enums::MessageReplyHeader::Header(m) => 
+                    tl::enums::MessageReplyHeader::Header(m) =>
                         ("Header", m.forum_topic, m.reply_to_top_id, m.reply_to_msg_id),
-                    tl::enums::MessageReplyHeader::MessageReplyHeader(m) => 
-                        ("MessageReplyHeader", m.forum_topic, m.reply_to_top_id, m.reply_to_msg_id),
                     _ => ("Unknown", false, None, None),
                 };
-                
-                let is_in_forum = if let Some(chat) = self.chat().as_channel() {
-                    chat.is_forum()
-                } else {
-                    false
-                };
-                
+
                 format!(
                     "Topic Debug Info:\n\
                      - Message ID: {}\n\
-                     - Chat is forum-enabled: {}\n\
                      - Reply header variant: {}\n\
                      - forum_topic flag: {}\n\
                      - reply_to_top_id: {:?}\n\
                      - reply_to_msg_id: {:?}\n\
                      - topic_id() returns: {:?}",
                     self.raw.id,
-                    is_in_forum,
                     variant,
                     forum_topic,
                     reply_to_top_id,

@@ -32,7 +32,7 @@ pub(super) const BOT_CHANNEL_DIFF_LIMIT: i32 = 100000;
 pub(super) const USER_CHANNEL_DIFF_LIMIT: i32 = 100;
 
 // > It may be useful to wait up to 0.5 seconds
-pub(super) const POSSIBLE_GAP_TIMEOUT: Duration = Duration::from_millis(500);
+pub(super) const POSSIBLE_GAP_TIMEOUT: Duration = Duration::from_millis(3000);
 
 /// After how long without updates the client will "timeout".
 ///
@@ -90,6 +90,10 @@ pub struct MessageBox {
 
     /// This field is merely an optimization, to reuse the same allocation.
     pub(super) tmp_entries: HashSet<Entry>,
+
+    /// Updates that arrived while getDifference was in progress for their entry.
+    /// These are replayed after getDifference completes instead of being silently dropped.
+    pub(super) pending_during_diff: HashMap<Entry, Vec<tl::enums::Update>>,
 }
 
 /// Represents the information needed to correctly handle a specific `tl::enums::Update`.

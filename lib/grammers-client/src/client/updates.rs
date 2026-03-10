@@ -224,7 +224,10 @@ impl Client {
                             result = Some(tup);
                         }
                     }
-                    Err(_) => return,
+                    // Continue processing remaining updates in the batch instead of
+                    // stopping entirely. A gap in one update shouldn't cause all
+                    // subsequent updates in the batch to be silently dropped.
+                    Err(_) => continue,
                 }
             }
         }

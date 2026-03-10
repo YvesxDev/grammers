@@ -69,8 +69,8 @@ pub(super) fn update_short_message(
                     .into(),
                 ),
                 from_boosts_applied: None,
-                peer_id: tl::types::PeerChat {
-                    chat_id: short.user_id,
+                peer_id: tl::types::PeerUser {
+                    user_id: short.user_id,
                 }
                 .into(),
                 saved_peer_id: None,
