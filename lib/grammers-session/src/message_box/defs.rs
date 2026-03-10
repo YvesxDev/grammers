@@ -31,8 +31,11 @@ pub(super) const NO_DATE: i32 = 0;
 pub(super) const BOT_CHANNEL_DIFF_LIMIT: i32 = 100000;
 pub(super) const USER_CHANNEL_DIFF_LIMIT: i32 = 100;
 
-// > It may be useful to wait up to 0.5 seconds
-pub(super) const POSSIBLE_GAP_TIMEOUT: Duration = Duration::from_millis(3000);
+// Telegram docs suggest up to 0.5 seconds, but gotd (Go MTProto client)
+// triggers getDifference immediately on gap detection for faster recovery.
+// We use a minimal timeout — just enough to let the current batch finish
+// processing before triggering getDifference.
+pub(super) const POSSIBLE_GAP_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// After how long without updates the client will "timeout".
 ///

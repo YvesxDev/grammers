@@ -856,13 +856,14 @@ impl MessageBox {
             }
         } else {
             warn!(
-                "cannot getChannelDifference for {} as we're missing its hash",
+                "cannot getChannelDifference for {} as we're missing its hash; fast-forwarding pts",
                 id
             );
-            self.end_get_diff(entry);
-            // Remove the outdated `pts` entry from the map so that the next update can correct
-            // it. Otherwise, it will spam that the access hash is missing.
-            self.map.remove(&entry);
+            // Don't remove the map entry — that would cause an infinite cycle of:
+            // gap detected → hash missing → entry removed → new entry → gap detected.
+            // Instead, end getDiff (which replays buffered updates) and keep the pts
+            // so future updates can be applied from wherever we are now.
+            let _ = self.end_get_diff(entry);
             None
         }
     }
