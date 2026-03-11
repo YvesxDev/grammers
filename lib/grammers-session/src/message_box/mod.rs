@@ -201,15 +201,39 @@ impl MessageBox {
                     }
                 }));
 
+            // Only apply NO_UPDATES_TIMEOUT to AccountWide and SecretChats.
+            // Individual channels should NOT trigger getDifference on timeout because:
+            // 1. Many channels are low-activity (hours between posts) — 15 min timeout is too aggressive
+            // 2. When monitoring 44+ channels, ALL would expire simultaneously, creating a massive
+            //    getDifference storm that takes 30+ minutes to resolve sequentially
+            // 3. Channel gaps are detected via pts mismatches, which is more reliable than timeouts
+            // This matches gotd's behavior (the Go MTProto client) which does not use timeouts for channels.
             self.getting_diff_for
                 .extend(self.map.iter().filter_map(|(entry, state)| {
                     if now >= state.deadline {
-                        debug!("too much time has passed without updates for {:?}", entry);
-                        Some(entry)
+                        match entry {
+                            Entry::AccountWide | Entry::SecretChats => {
+                                debug!("too much time has passed without updates for {:?}", entry);
+                                Some(entry)
+                            }
+                            Entry::Channel(_) => {
+                                // Don't trigger getDifference for channels based on timeout alone.
+                                // Just reset the deadline so we don't keep checking.
+                                None
+                            }
+                        }
                     } else {
                         None
                     }
                 }));
+
+            // Reset expired channel deadlines so they don't fire on every check_deadlines call.
+            let new_deadline = next_updates_deadline();
+            for (entry, state) in self.map.iter_mut() {
+                if matches!(entry, Entry::Channel(_)) && now >= state.deadline {
+                    state.deadline = new_deadline;
+                }
+            }
 
             // When extending `getting_diff_for`, it's important to have the moral equivalent of
             // `begin_get_diff` (that is, clear possible gaps if we're now getting difference).

@@ -91,18 +91,10 @@ impl Client {
                 )
             };
 
-            if let Some(request) = get_diff {
-                let response = self.invoke(&request).await?;
-                let (updates, users, chats) = {
-                    let state = &mut *self.0.state.write().unwrap();
-                    state
-                        .message_box
-                        .apply_difference(response, &mut state.chat_hashes)
-                };
-                self.extend_update_queue(updates, ChatMap::new(users, chats));
-                continue;
-            }
-
+            // Process channel differences FIRST — they are fast (one call per channel)
+            // and contain the messages users actually care about. AccountWide getDifference
+            // can take many DifferenceSlice rounds (potentially 30+ minutes for active accounts),
+            // and would otherwise block ALL channel recovery the entire time.
             if let Some(request) = get_channel_diff {
                 let maybe_response = self.invoke(&request).await;
 
@@ -180,6 +172,20 @@ impl Client {
                     )
                 };
 
+                self.extend_update_queue(updates, ChatMap::new(users, chats));
+                continue;
+            }
+
+            // AccountWide getDifference runs AFTER all channel differences are done.
+            // This can take many DifferenceSlice rounds but won't block channel messages.
+            if let Some(request) = get_diff {
+                let response = self.invoke(&request).await?;
+                let (updates, users, chats) = {
+                    let state = &mut *self.0.state.write().unwrap();
+                    state
+                        .message_box
+                        .apply_difference(response, &mut state.chat_hashes)
+                };
                 self.extend_update_queue(updates, ChatMap::new(users, chats));
                 continue;
             }
