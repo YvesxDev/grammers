@@ -201,39 +201,19 @@ impl MessageBox {
                     }
                 }));
 
-            // Only apply NO_UPDATES_TIMEOUT to AccountWide and SecretChats.
-            // Individual channels should NOT trigger getDifference on timeout because:
-            // 1. Many channels are low-activity (hours between posts) — 15 min timeout is too aggressive
-            // 2. When monitoring 44+ channels, ALL would expire simultaneously, creating a massive
-            //    getDifference storm that takes 30+ minutes to resolve sequentially
-            // 3. Channel gaps are detected via pts mismatches, which is more reliable than timeouts
-            // This matches gotd's behavior (the Go MTProto client) which does not use timeouts for channels.
+            // Apply NO_UPDATES_TIMEOUT to all entries (including channels).
+            // gotd also uses a 15-min idle timeout per channel. With parallel
+            // getChannelDifference, simultaneous expiry of many channels is
+            // handled gracefully (all fired concurrently via join_all).
             self.getting_diff_for
                 .extend(self.map.iter().filter_map(|(entry, state)| {
                     if now >= state.deadline {
-                        match entry {
-                            Entry::AccountWide | Entry::SecretChats => {
-                                debug!("too much time has passed without updates for {:?}", entry);
-                                Some(entry)
-                            }
-                            Entry::Channel(_) => {
-                                // Don't trigger getDifference for channels based on timeout alone.
-                                // Just reset the deadline so we don't keep checking.
-                                None
-                            }
-                        }
+                        debug!("too much time has passed without updates for {:?}", entry);
+                        Some(entry)
                     } else {
                         None
                     }
                 }));
-
-            // Reset expired channel deadlines so they don't fire on every check_deadlines call.
-            let new_deadline = next_updates_deadline();
-            for (entry, state) in self.map.iter_mut() {
-                if matches!(entry, Entry::Channel(_)) && now >= state.deadline {
-                    state.deadline = new_deadline;
-                }
-            }
 
             // When extending `getting_diff_for`, it's important to have the moral equivalent of
             // `begin_get_diff` (that is, clear possible gaps if we're now getting difference).
@@ -622,7 +602,11 @@ impl MessageBox {
                         "gap on update for {:?} (local {:?}, count {:?}, remote {:?})",
                         pts.entry, local_pts, pts.pts_count, pts.pts
                     );
-                    // TODO store chats too?
+
+                    // Buffer the update and wait for POSSIBLE_GAP_TIMEOUT (100ms) before
+                    // triggering getDifference. This gives out-of-order updates a chance to
+                    // arrive and fill the gap naturally, avoiding unnecessary API calls.
+                    // gotd uses 500ms for this; our 100ms is a faster compromise.
                     self.possible_gaps
                         .entry(pts.entry)
                         .or_insert_with(|| PossibleGap {
@@ -890,6 +874,68 @@ impl MessageBox {
             let _ = self.end_get_diff(entry);
             None
         }
+    }
+
+    /// Return ALL pending channel difference requests at once, for concurrent processing.
+    ///
+    /// Unlike [`get_channel_difference`] which returns one request at a time,
+    /// this collects all pending channel entries and returns their requests together.
+    /// The caller can then fire them concurrently (e.g. via `join_all`), matching
+    /// gotd's parallel goroutine approach.
+    pub fn get_all_channel_differences(
+        &mut self,
+        chat_hashes: &ChatHashCache,
+    ) -> Vec<tl::functions::updates::GetChannelDifference> {
+        let channel_entries: Vec<(Entry, i64)> = self
+            .getting_diff_for
+            .iter()
+            .filter_map(|&entry| match entry {
+                Entry::Channel(id) => Some((entry, id)),
+                _ => None,
+            })
+            .collect();
+
+        let mut requests = Vec::new();
+        let mut missing_hash_entries = Vec::new();
+
+        for (entry, id) in channel_entries {
+            if let Some(packed) = chat_hashes.get(id) {
+                let channel = tl::types::InputChannel {
+                    channel_id: packed.id,
+                    access_hash: packed
+                        .access_hash
+                        .expect("chat_hashes had chat without hash"),
+                }
+                .into();
+                if let Some(state) = self.map.get(&entry) {
+                    let gd = tl::functions::updates::GetChannelDifference {
+                        force: false,
+                        channel,
+                        filter: tl::enums::ChannelMessagesFilter::Empty,
+                        pts: state.pts,
+                        limit: if chat_hashes.is_self_bot() {
+                            defs::BOT_CHANNEL_DIFF_LIMIT
+                        } else {
+                            defs::USER_CHANNEL_DIFF_LIMIT
+                        },
+                    };
+                    trace!("requesting {:?}", gd);
+                    requests.push(gd);
+                }
+            } else {
+                missing_hash_entries.push((entry, id));
+            }
+        }
+
+        for (entry, id) in missing_hash_entries {
+            warn!(
+                "cannot getChannelDifference for {} as we're missing its hash; fast-forwarding pts",
+                id
+            );
+            let _ = self.end_get_diff(entry);
+        }
+
+        requests
     }
 
     /// Similar to [`MessageBox::process_updates`], but using the result from getting difference.

@@ -10,7 +10,7 @@
 
 use super::Client;
 use crate::types::{ChatMap, Update};
-use futures_util::future::{Either, select};
+use futures_util::future::{Either, join_all, select};
 use grammers_mtsender::utils::sleep_until;
 pub use grammers_mtsender::{AuthorizationError, InvocationError};
 use grammers_session::channel_id;
@@ -79,7 +79,7 @@ impl Client {
         &self,
     ) -> Result<(tl::enums::Update, Arc<ChatMap>), InvocationError> {
         loop {
-            let (deadline, get_diff, get_channel_diff) = {
+            let (deadline, get_diff, channel_requests) = {
                 let state = &mut *self.0.state.write().unwrap();
                 if let Some(update) = state.updates.pop_front() {
                     return Ok(update);
@@ -87,35 +87,73 @@ impl Client {
                 (
                     state.message_box.check_deadlines(), // first, as it might trigger differences
                     state.message_box.get_difference(),
-                    state.message_box.get_channel_difference(&state.chat_hashes),
+                    state.message_box.get_all_channel_differences(&state.chat_hashes),
                 )
             };
 
-            // Process channel differences FIRST — they are fast (one call per channel)
-            // and contain the messages users actually care about. AccountWide getDifference
-            // can take many DifferenceSlice rounds (potentially 30+ minutes for active accounts),
-            // and would otherwise block ALL channel recovery the entire time.
-            if let Some(request) = get_channel_diff {
-                let maybe_response = self.invoke(&request).await;
+            // Process ALL channel differences CONCURRENTLY via join_all, matching
+            // gotd's goroutine-per-channel model. While waiting, we race against
+            // step() so real-time socket updates from unaffected channels are
+            // delivered immediately — not blocked by getDifference recovery.
+            if !channel_requests.is_empty() {
+                if channel_requests.len() > 1 {
+                    log::debug!(
+                        "fetching {} channel differences concurrently",
+                        channel_requests.len()
+                    );
+                }
 
-                let response = match maybe_response {
-                    Ok(r) => r,
-                    Err(e) if e.is("PERSISTENT_TIMESTAMP_OUTDATED") => {
-                        // According to Telegram's docs:
-                        // "Channel internal replication issues, try again later (treat this like an RPC_CALL_FAIL)."
-                        // We can treat this as "empty difference" and not update the local pts.
-                        // Then this same call will be retried when another gap is detected or timeout expires.
-                        //
-                        // Another option would be to literally treat this like an RPC_CALL_FAIL and retry after a few
-                        // seconds, but if Telegram is having issues it's probably best to wait for it to send another
-                        // update (hinting it may be okay now) and retry then.
-                        //
-                        // This is a bit hacky because MessageBox doesn't really have a way to "not update" the pts.
-                        // Instead we manually extract the previously-known pts and use that.
-                        log::warn!(
-                            "Getting difference for channel updates caused PersistentTimestampOutdated; ending getting difference prematurely until server issues are resolved"
-                        );
-                        {
+                let diff_future = join_all(
+                    channel_requests.iter().map(|req| self.invoke(req)),
+                );
+                let mut diff_future = Box::pin(diff_future);
+
+                // Race getDifference against socket I/O. This ensures real-time
+                // messages for channels NOT in getDifference are delivered instantly.
+                let results = loop {
+                    // Deliver any queued real-time updates before blocking
+                    {
+                        let state = &mut *self.0.state.write().unwrap();
+                        if let Some(update) = state.updates.pop_front() {
+                            return Ok(update);
+                        }
+                    }
+
+                    let step = Box::pin(self.step());
+                    match select(diff_future, step).await {
+                        Either::Left((results, _)) => break results,
+                        Either::Right((step_result, remaining_diff)) => {
+                            step_result?;
+                            diff_future = remaining_diff;
+                            // step() processed socket data → loop back to check queue
+                        }
+                    }
+                };
+
+                let mut all_updates = Vec::new();
+                let mut all_users = Vec::new();
+                let mut all_chats = Vec::new();
+                let mut fatal_error = None;
+
+                for (request, result) in channel_requests.into_iter().zip(results) {
+                    match result {
+                        Ok(response) => {
+                            let (updates, users, chats) = {
+                                let state = &mut *self.0.state.write().unwrap();
+                                state.message_box.apply_channel_difference(
+                                    request,
+                                    response,
+                                    &mut state.chat_hashes,
+                                )
+                            };
+                            all_updates.extend(updates);
+                            all_users.extend(users);
+                            all_chats.extend(chats);
+                        }
+                        Err(e) if e.is("PERSISTENT_TIMESTAMP_OUTDATED") => {
+                            log::warn!(
+                                "Getting difference for channel caused PersistentTimestampOutdated"
+                            );
                             self.0
                                 .state
                                 .write()
@@ -126,28 +164,28 @@ impl Client {
                                     PrematureEndReason::TemporaryServerIssues,
                                 );
                         }
-                        continue;
-                    }
-                    Err(e) if e.is("CHANNEL_PRIVATE") => {
-                        log::info!(
-                            "Account is now banned in {} so we can no longer fetch updates from it",
-                            channel_id(&request)
-                                .map(|i| i.to_string())
-                                .unwrap_or_else(|| "empty channel".into())
-                        );
-                        {
+                        Err(e) if e.is("CHANNEL_PRIVATE") => {
+                            log::info!(
+                                "Account is now banned in {} so we can no longer fetch updates from it",
+                                channel_id(&request)
+                                    .map(|i| i.to_string())
+                                    .unwrap_or_else(|| "empty channel".into())
+                            );
                             self.0
                                 .state
                                 .write()
                                 .unwrap()
                                 .message_box
-                                .end_channel_difference(&request, PrematureEndReason::Banned);
+                                .end_channel_difference(
+                                    &request,
+                                    PrematureEndReason::Banned,
+                                );
                         }
-                        continue;
-                    }
-                    Err(InvocationError::Rpc(rpc_error)) if rpc_error.code == 500 => {
-                        log::warn!("Telegram is having internal issues: {:#?}", rpc_error);
-                        {
+                        Err(InvocationError::Rpc(ref rpc_error)) if rpc_error.code == 500 => {
+                            log::warn!(
+                                "Telegram is having internal issues: {:#?}",
+                                rpc_error
+                            );
                             self.0
                                 .state
                                 .write()
@@ -158,28 +196,51 @@ impl Client {
                                     PrematureEndReason::TemporaryServerIssues,
                                 );
                         }
-                        continue;
+                        Err(e) => {
+                            fatal_error = Some(e);
+                        }
                     }
-                    Err(e) => return Err(e),
-                };
+                }
 
-                let (updates, users, chats) = {
-                    let state = &mut *self.0.state.write().unwrap();
-                    state.message_box.apply_channel_difference(
-                        request,
-                        response,
-                        &mut state.chat_hashes,
-                    )
-                };
+                if !all_updates.is_empty() {
+                    self.extend_update_queue(
+                        all_updates,
+                        ChatMap::new(all_users, all_chats),
+                    );
+                }
 
-                self.extend_update_queue(updates, ChatMap::new(users, chats));
+                if let Some(e) = fatal_error {
+                    return Err(e);
+                }
+
                 continue;
             }
 
-            // AccountWide getDifference runs AFTER all channel differences are done.
-            // This can take many DifferenceSlice rounds but won't block channel messages.
+            // AccountWide getDifference — one DifferenceSlice per iteration.
+            // Race against step() so real-time messages are delivered between
+            // slices instead of waiting for the entire multi-round recovery.
             if let Some(request) = get_diff {
-                let response = self.invoke(&request).await?;
+                let invoke_future = Box::pin(self.invoke(&request));
+                let mut invoke_future = invoke_future;
+
+                let response = loop {
+                    {
+                        let state = &mut *self.0.state.write().unwrap();
+                        if let Some(update) = state.updates.pop_front() {
+                            return Ok(update);
+                        }
+                    }
+
+                    let step = Box::pin(self.step());
+                    match select(invoke_future, step).await {
+                        Either::Left((result, _)) => break result?,
+                        Either::Right((step_result, remaining)) => {
+                            step_result?;
+                            invoke_future = remaining;
+                        }
+                    }
+                };
+
                 let (updates, users, chats) = {
                     let state = &mut *self.0.state.write().unwrap();
                     state
