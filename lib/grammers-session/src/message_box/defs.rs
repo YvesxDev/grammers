@@ -96,7 +96,12 @@ pub struct MessageBox {
 
     /// Updates that arrived while getDifference was in progress for their entry.
     /// These are replayed after getDifference completes instead of being silently dropped.
+    /// Only used for non-channel entries; channel updates are delivered immediately.
     pub(super) pending_during_diff: HashMap<Entry, Vec<tl::enums::Update>>,
+
+    /// Message IDs delivered via socket while getDifference was in progress for a channel.
+    /// Used to deduplicate against getDifference results (which may include the same messages).
+    pub(super) delivered_during_diff: HashMap<Entry, HashSet<i32>>,
 }
 
 /// Represents the information needed to correctly handle a specific `tl::enums::Update`.

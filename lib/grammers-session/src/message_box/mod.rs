@@ -63,6 +63,7 @@ impl MessageBox {
             next_deadline: None,
             tmp_entries: HashSet::new(),
             pending_during_diff: HashMap::new(),
+            delivered_during_diff: HashMap::new(),
         }
     }
 
@@ -120,6 +121,7 @@ impl MessageBox {
             next_deadline: Some(Entry::AccountWide),
             tmp_entries: HashSet::new(),
             pending_during_diff: HashMap::new(),
+            delivered_during_diff: HashMap::new(),
         }
     }
 
@@ -354,10 +356,13 @@ impl MessageBox {
         };
         self.reset_deadline(entry, next_updates_deadline());
 
+        // Clean up socket-delivered message ID tracking for this entry
+        self.delivered_during_diff.remove(&entry);
+
         // Replay updates that arrived during getDifference.
-        // Now that getDifference is complete and pts is updated, these updates
-        // can be properly evaluated: duplicates will be skipped, valid ones applied,
-        // and any remaining gaps handled normally.
+        // For channel entries, updates were delivered immediately (not buffered),
+        // so this will typically be empty. For non-channel entries, buffered
+        // updates are replayed now.
         let mut result = Vec::new();
         if let Some(buffered) = self.pending_during_diff.remove(&entry) {
             if !buffered.is_empty() {
@@ -549,6 +554,23 @@ impl MessageBox {
         Ok((result, users, chats))
     }
 
+    /// Extract the message ID from a channel message update, for deduplication tracking.
+    fn extract_channel_message_id(update: &tl::enums::Update) -> Option<i32> {
+        match update {
+            tl::enums::Update::NewChannelMessage(u) => match &u.message {
+                tl::enums::Message::Message(m) => Some(m.id),
+                tl::enums::Message::Service(m) => Some(m.id),
+                tl::enums::Message::Empty(m) => Some(m.id),
+            },
+            tl::enums::Update::EditChannelMessage(u) => match &u.message {
+                tl::enums::Message::Message(m) => Some(m.id),
+                tl::enums::Message::Service(m) => Some(m.id),
+                tl::enums::Message::Empty(m) => Some(m.id),
+            },
+            _ => None,
+        }
+    }
+
     /// Tries to apply the input update if its `PtsInfo` follows the correct order.
     ///
     /// If the update can be applied, it is returned; otherwise, the update is stored in a
@@ -559,7 +581,28 @@ impl MessageBox {
         update: tl::enums::Update,
     ) -> (Option<Entry>, Option<tl::enums::Update>) {
         if let tl::enums::Update::ChannelTooLong(u) = update {
-            self.try_begin_get_diff(Entry::Channel(u.channel_id));
+            let entry = Entry::Channel(u.channel_id);
+
+            // If the remote pts is provided and we're only slightly behind,
+            // just advance pts and skip getDifference. This prevents unnecessary
+            // getDifference calls for high-volume channels where the gap is small
+            // and new socket updates will fill it naturally.
+            if let Some(remote_pts) = u.pts {
+                if let Some(state) = self.map.get_mut(&entry) {
+                    let behind = remote_pts - state.pts;
+                    if behind <= 10 {
+                        info!(
+                            "ChannelTooLong for {} but only {} pts behind; advancing pts to {} instead of getDifference",
+                            u.channel_id, behind, remote_pts
+                        );
+                        state.pts = remote_pts;
+                        state.deadline = next_updates_deadline();
+                        return (None, None);
+                    }
+                }
+            }
+
+            self.try_begin_get_diff(entry);
             return (None, None);
         }
 
@@ -570,6 +613,37 @@ impl MessageBox {
         };
 
         if self.getting_diff_for.contains(&pts.entry) {
+            if matches!(pts.entry, Entry::Channel(_)) {
+                // For channels: deliver immediately instead of buffering.
+                // getDifference blocks ALL messages for a channel until it completes,
+                // which causes 1-4+ minute delays for high-volume channels.
+                // By delivering immediately, real-time messages flow without delay.
+                // getDifference still runs to fill the gap; duplicates are filtered
+                // via delivered_during_diff tracking.
+                debug!(
+                    "delivering channel update during getDifference for {:?} (count {:?}, remote {:?})",
+                    pts.entry, pts.pts_count, pts.pts
+                );
+
+                // Track message IDs for deduplication when getDifference completes
+                if let Some(msg_id) = Self::extract_channel_message_id(&update) {
+                    self.delivered_during_diff
+                        .entry(pts.entry)
+                        .or_default()
+                        .insert(msg_id);
+                }
+
+                // Advance pts (only forward, never backward) so subsequent updates
+                // for this channel don't all look like gaps
+                if let Some(state) = self.map.get_mut(&pts.entry) {
+                    if pts.pts > state.pts {
+                        state.pts = pts.pts;
+                    }
+                }
+
+                return (Some(pts.entry), Some(update));
+            }
+
             debug!(
                 "buffering update for {:?} during getDifference (count {:?}, remote {:?})",
                 pts.entry, pts.pts_count, pts.pts
@@ -938,6 +1012,50 @@ impl MessageBox {
         requests
     }
 
+    /// Extract a message ID from a `tl::enums::Message`.
+    fn message_id(message: &tl::enums::Message) -> i32 {
+        match message {
+            tl::enums::Message::Message(m) => m.id,
+            tl::enums::Message::Service(m) => m.id,
+            tl::enums::Message::Empty(m) => m.id,
+        }
+    }
+
+    /// Filter new_messages from getDifference to exclude those already delivered via socket.
+    /// Returns the filtered list, removing duplicates.
+    fn filter_already_delivered(
+        &self,
+        entry: &Entry,
+        messages: Vec<tl::enums::Message>,
+    ) -> Vec<tl::enums::Message> {
+        if let Some(delivered_ids) = self.delivered_during_diff.get(entry) {
+            if !delivered_ids.is_empty() {
+                let before = messages.len();
+                let filtered: Vec<_> = messages
+                    .into_iter()
+                    .filter(|msg| !delivered_ids.contains(&Self::message_id(msg)))
+                    .collect();
+                let skipped = before - filtered.len();
+                if skipped > 0 {
+                    debug!(
+                        "filtered {} already-delivered messages from getDifference for {:?}",
+                        skipped, entry
+                    );
+                }
+                return filtered;
+            }
+        }
+        messages
+    }
+
+    /// When setting pts from getDifference, use the max of response and current.
+    /// Socket-delivered updates may have advanced pts beyond what getDifference returns.
+    fn set_channel_pts_max(&mut self, entry: &Entry, response_pts: i32) {
+        if let Some(state) = self.map.get_mut(entry) {
+            state.pts = response_pts.max(state.pts);
+        }
+    }
+
     /// Similar to [`MessageBox::process_updates`], but using the result from getting difference.
     pub fn apply_channel_difference(
         &mut self,
@@ -962,7 +1080,7 @@ impl MessageBox {
                     channel_id, diff.pts
                 );
                 let replayed = self.end_get_diff(entry);
-                self.map.get_mut(&entry).unwrap().pts = diff.pts;
+                self.set_channel_pts_max(&entry, diff.pts);
                 (replayed, Vec::new(), Vec::new())
             }
             tl::enums::updates::ChannelDifference::TooLong(diff) => {
@@ -973,26 +1091,24 @@ impl MessageBox {
                     "handling too long channel {} difference; no longer getting diff",
                     channel_id
                 );
-                match diff.dialog {
-                    tl::enums::Dialog::Dialog(d) => {
-                        self.map.get_mut(&entry).unwrap().pts = d.pts.expect(
-                            "channelDifferenceTooLong dialog did not actually contain a pts",
-                        );
-                    }
+                let too_long_pts = match diff.dialog {
+                    tl::enums::Dialog::Dialog(d) => d.pts.expect(
+                        "channelDifferenceTooLong dialog did not actually contain a pts",
+                    ),
                     tl::enums::Dialog::Folder(_) => {
                         panic!("received a folder on channelDifferenceTooLong")
                     }
-                }
+                };
+
+                // Filter messages already delivered via socket during getDifference
+                let new_messages = self.filter_already_delivered(&entry, diff.messages);
 
                 // End getDifference and replay buffered updates
                 let replayed = self.end_get_diff(entry);
+                self.set_channel_pts_max(&entry, too_long_pts);
                 self.reset_channel_deadline(channel_id, diff.timeout);
 
-                // Return available messages from the TooLong response instead of
-                // silently dropping them all. These are the "latest messages" that
-                // Telegram provides even when the full difference is too large.
-                let mut result_updates: Vec<tl::enums::Update> = diff
-                    .messages
+                let mut result_updates: Vec<tl::enums::Update> = new_messages
                     .into_iter()
                     .map(|message| {
                         tl::types::UpdateNewChannelMessage {
@@ -1019,6 +1135,9 @@ impl MessageBox {
             ) => {
                 let _ = chat_hashes.extend(&users, &chats);
 
+                // Filter messages already delivered via socket during getDifference
+                let new_messages = self.filter_already_delivered(&entry, new_messages);
+
                 if r#final {
                     debug!(
                         "handling channel {} difference; no longer getting diff",
@@ -1026,7 +1145,7 @@ impl MessageBox {
                     );
                     let replayed = self.end_get_diff(entry);
 
-                    self.map.get_mut(&entry).unwrap().pts = pts;
+                    self.set_channel_pts_max(&entry, pts);
                     let us = tl::enums::Updates::Updates(tl::types::Updates {
                         updates,
                         users,
@@ -1053,7 +1172,7 @@ impl MessageBox {
                 } else {
                     debug!("handling channel {} difference", channel_id);
 
-                    self.map.get_mut(&entry).unwrap().pts = pts;
+                    self.set_channel_pts_max(&entry, pts);
                     let us = tl::enums::Updates::Updates(tl::types::Updates {
                         updates,
                         users,
