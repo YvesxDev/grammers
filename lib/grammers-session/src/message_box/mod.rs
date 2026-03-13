@@ -29,10 +29,9 @@ use super::ChatHashCache;
 use crate::UpdateState;
 use crate::generated::enums::ChannelState as ChannelStateEnum;
 use crate::generated::types::ChannelState;
-use crate::message_box::defs::PossibleGap;
 pub(crate) use defs::Entry;
 pub use defs::{Gap, MessageBox};
-use defs::{NO_DATE, NO_PTS, NO_SEQ, POSSIBLE_GAP_TIMEOUT, PtsInfo, State};
+use defs::{NO_DATE, NO_PTS, NO_SEQ, PtsInfo, State};
 use grammers_tl_types as tl;
 use log::{debug, info, trace, warn};
 use std::cmp::Ordering;
@@ -105,12 +104,11 @@ impl MessageBox {
                 },
             )
         }));
-        getting_diff_for.extend(
-            state
-                .channels
-                .iter()
-                .map(|ChannelStateEnum::State(c)| (Entry::Channel(c.channel_id))),
-        );
+        // Do NOT add channels to getting_diff_for on load.
+        // Channel updates are delivered immediately (even on pts gap),
+        // so getDifference would only dump stale messages that cause
+        // multi-second latency. Any truly missed messages during
+        // downtime are already too old to be actionable.
 
         Self {
             map,
@@ -193,8 +191,13 @@ impl MessageBox {
 
         if now >= deadline {
             // Check all expired entries and add them to the list that needs getting difference.
+            // Skip channels — their gaps are delivered immediately in apply_pts_info,
+            // so there's nothing to recover via getDifference.
             self.getting_diff_for
                 .extend(self.possible_gaps.iter().filter_map(|(entry, gap)| {
+                    if matches!(entry, Entry::Channel(_)) {
+                        return None;
+                    }
                     if now >= gap.deadline {
                         info!("gap was not resolved after waiting for {:?}", entry);
                         Some(entry)
@@ -203,12 +206,15 @@ impl MessageBox {
                     }
                 }));
 
-            // Apply NO_UPDATES_TIMEOUT to all entries (including channels).
-            // gotd also uses a 15-min idle timeout per channel. With parallel
-            // getChannelDifference, simultaneous expiry of many channels is
-            // handled gracefully (all fired concurrently via join_all).
+            // Apply NO_UPDATES_TIMEOUT only to non-channel entries.
+            // Channels deliver updates immediately (even on gap) so getDifference
+            // would only fetch stale messages that cause 10-90s latency.
+            // A quiet channel just means no one posted — not a gap.
             self.getting_diff_for
                 .extend(self.map.iter().filter_map(|(entry, state)| {
+                    if matches!(entry, Entry::Channel(_)) {
+                        return None;
+                    }
                     if now >= state.deadline {
                         debug!("too much time has passed without updates for {:?}", entry);
                         Some(entry)
@@ -465,12 +471,14 @@ impl MessageBox {
                     return Ok((Vec::new(), users, chats));
                 }
                 Ordering::Less => {
-                    debug!(
-                        "gap detected (local seq {}, remote seq {})",
+                    info!(
+                        "seq gap detected (local {}, remote {}); delivering updates and triggering recovery",
                         self.seq, seq_start
                     );
                     self.try_begin_get_diff(Entry::AccountWide);
-                    return Err(Gap);
+                    // Fall through to process individual updates immediately.
+                    // getDifference will recover any truly missed updates in the background.
+                    // Seq will be updated at the end of this method if updates are delivered.
                 }
             }
         }
@@ -554,28 +562,27 @@ impl MessageBox {
         Ok((result, users, chats))
     }
 
-    /// Extract the message ID from a channel message update, for deduplication tracking.
-    fn extract_channel_message_id(update: &tl::enums::Update) -> Option<i32> {
-        match update {
-            tl::enums::Update::NewChannelMessage(u) => match &u.message {
-                tl::enums::Message::Message(m) => Some(m.id),
-                tl::enums::Message::Service(m) => Some(m.id),
-                tl::enums::Message::Empty(m) => Some(m.id),
-            },
-            tl::enums::Update::EditChannelMessage(u) => match &u.message {
-                tl::enums::Message::Message(m) => Some(m.id),
-                tl::enums::Message::Service(m) => Some(m.id),
-                tl::enums::Message::Empty(m) => Some(m.id),
-            },
+    /// Extract the message ID from a message update, for deduplication tracking.
+    fn extract_message_id(update: &tl::enums::Update) -> Option<i32> {
+        let message = match update {
+            tl::enums::Update::NewMessage(u) => Some(&u.message),
+            tl::enums::Update::NewChannelMessage(u) => Some(&u.message),
+            tl::enums::Update::EditMessage(u) => Some(&u.message),
+            tl::enums::Update::EditChannelMessage(u) => Some(&u.message),
             _ => None,
+        }?;
+        match message {
+            tl::enums::Message::Message(m) => Some(m.id),
+            tl::enums::Message::Service(m) => Some(m.id),
+            tl::enums::Message::Empty(m) => Some(m.id),
         }
     }
 
     /// Tries to apply the input update if its `PtsInfo` follows the correct order.
     ///
-    /// If the update can be applied, it is returned; otherwise, the update is stored in a
-    /// possible gap (unless it was already handled or would be handled through getting
-    /// difference) and `None` is returned.
+    /// Updates are always delivered immediately regardless of gaps or getDifference state.
+    /// Gaps trigger background recovery via getDifference, whose results are deduplicated
+    /// against already-delivered updates via `delivered_during_diff` tracking.
     fn apply_pts_info(
         &mut self,
         update: tl::enums::Update,
@@ -583,26 +590,16 @@ impl MessageBox {
         if let tl::enums::Update::ChannelTooLong(u) = update {
             let entry = Entry::Channel(u.channel_id);
 
-            // If the remote pts is provided and we're only slightly behind,
-            // just advance pts and skip getDifference. This prevents unnecessary
-            // getDifference calls for high-volume channels where the gap is small
-            // and new socket updates will fill it naturally.
             if let Some(remote_pts) = u.pts {
                 if let Some(state) = self.map.get_mut(&entry) {
-                    let behind = remote_pts - state.pts;
-                    if behind <= 10 {
-                        info!(
-                            "ChannelTooLong for {} but only {} pts behind; advancing pts to {} instead of getDifference",
-                            u.channel_id, behind, remote_pts
-                        );
-                        state.pts = remote_pts;
-                        state.deadline = next_updates_deadline();
-                        return (None, None);
-                    }
+                    info!(
+                        "ChannelTooLong for {}; fast-forwarding pts from {} to {}",
+                        u.channel_id, state.pts, remote_pts
+                    );
+                    state.pts = remote_pts;
+                    state.deadline = next_updates_deadline();
                 }
             }
-
-            self.try_begin_get_diff(entry);
             return (None, None);
         }
 
@@ -612,50 +609,28 @@ impl MessageBox {
             None => return (None, Some(update)),
         };
 
+        // During getDifference: deliver immediately for ALL entries.
+        // getDifference results are deduplicated via delivered_during_diff tracking.
         if self.getting_diff_for.contains(&pts.entry) {
-            if matches!(pts.entry, Entry::Channel(_)) {
-                // For channels: deliver immediately instead of buffering.
-                // getDifference blocks ALL messages for a channel until it completes,
-                // which causes 1-4+ minute delays for high-volume channels.
-                // By delivering immediately, real-time messages flow without delay.
-                // getDifference still runs to fill the gap; duplicates are filtered
-                // via delivered_during_diff tracking.
-                debug!(
-                    "delivering channel update during getDifference for {:?} (count {:?}, remote {:?})",
-                    pts.entry, pts.pts_count, pts.pts
-                );
-
-                // Track message IDs for deduplication when getDifference completes
-                if let Some(msg_id) = Self::extract_channel_message_id(&update) {
-                    self.delivered_during_diff
-                        .entry(pts.entry)
-                        .or_default()
-                        .insert(msg_id);
-                }
-
-                // Advance pts (only forward, never backward) so subsequent updates
-                // for this channel don't all look like gaps
-                if let Some(state) = self.map.get_mut(&pts.entry) {
-                    if pts.pts > state.pts {
-                        state.pts = pts.pts;
-                    }
-                }
-
-                return (Some(pts.entry), Some(update));
-            }
-
             debug!(
-                "buffering update for {:?} during getDifference (count {:?}, remote {:?})",
+                "delivering update during getDifference for {:?} (count {:?}, remote {:?})",
                 pts.entry, pts.pts_count, pts.pts
             );
-            // Buffer the update for replay after getDifference completes, instead of
-            // silently dropping it. If getDifference returns TooLong, these buffered
-            // updates would otherwise be permanently lost.
-            self.pending_during_diff
-                .entry(pts.entry)
-                .or_insert_with(Vec::new)
-                .push(update);
-            return (Some(pts.entry), None);
+
+            if let Some(msg_id) = Self::extract_message_id(&update) {
+                self.delivered_during_diff
+                    .entry(pts.entry)
+                    .or_default()
+                    .insert(msg_id);
+            }
+
+            if let Some(state) = self.map.get_mut(&pts.entry) {
+                if pts.pts > state.pts {
+                    state.pts = pts.pts;
+                }
+            }
+
+            return (Some(pts.entry), Some(update));
         }
 
         if let Some(state) = self.map.get(&pts.entry) {
@@ -671,26 +646,30 @@ impl MessageBox {
                     );
                     return (Some(pts.entry), None);
                 }
+                // Gap: deliver immediately, advance pts, trigger background recovery.
                 Ordering::Less => {
                     info!(
-                        "gap on update for {:?} (local {:?}, count {:?}, remote {:?})",
+                        "gap for {:?} (local {:?}, count {:?}, remote {:?}); delivering immediately",
                         pts.entry, local_pts, pts.pts_count, pts.pts
                     );
 
-                    // Buffer the update and wait for POSSIBLE_GAP_TIMEOUT (100ms) before
-                    // triggering getDifference. This gives out-of-order updates a chance to
-                    // arrive and fill the gap naturally, avoiding unnecessary API calls.
-                    // gotd uses 500ms for this; our 100ms is a faster compromise.
-                    self.possible_gaps
-                        .entry(pts.entry)
-                        .or_insert_with(|| PossibleGap {
-                            deadline: Instant::now() + POSSIBLE_GAP_TIMEOUT,
-                            updates: Vec::new(),
-                        })
-                        .updates
-                        .push(update);
+                    if let Some(msg_id) = Self::extract_message_id(&update) {
+                        self.delivered_during_diff
+                            .entry(pts.entry)
+                            .or_default()
+                            .insert(msg_id);
+                    }
 
-                    return (Some(pts.entry), None);
+                    self.map.get_mut(&pts.entry).unwrap().pts = pts.pts;
+
+                    // Trigger getDifference to recover potentially missed updates.
+                    // For channels, skip recovery — gaps are frequent due to high
+                    // volume and getDifference just adds latency.
+                    if !matches!(pts.entry, Entry::Channel(_)) {
+                        self.try_begin_get_diff(pts.entry);
+                    }
+
+                    return (Some(pts.entry), Some(update));
                 }
             }
         }
@@ -755,8 +734,8 @@ impl MessageBox {
                     diff.date, diff.seq
                 );
                 finish = true;
-                self.date = diff.date;
-                self.seq = diff.seq;
+                self.date = self.date.max(diff.date);
+                self.seq = self.seq.max(diff.seq);
                 (Vec::new(), Vec::new(), Vec::new())
             }
             tl::enums::updates::Difference::Difference(diff) => {
@@ -802,7 +781,8 @@ impl MessageBox {
                 );
                 finish = true;
                 // the deadline will be reset once the diff ends
-                self.map.get_mut(&Entry::AccountWide).unwrap().pts = diff.pts;
+                let aw = self.map.get_mut(&Entry::AccountWide).unwrap();
+                aw.pts = aw.pts.max(diff.pts);
                 (Vec::new(), Vec::new(), Vec::new())
             }
         };
@@ -842,17 +822,21 @@ impl MessageBox {
         }: tl::types::updates::Difference,
         chat_hashes: &mut ChatHashCache,
     ) -> defs::UpdateAndPeers {
-        self.map.get_mut(&Entry::AccountWide).unwrap().pts = state.pts;
-        self.map
+        // Use max() for all state fields — socket-delivered updates during getDifference
+        // may have advanced these beyond what the getDifference response contains.
+        // Rewinding would cause cascading false gaps.
+        let aw = self.map.get_mut(&Entry::AccountWide).unwrap();
+        aw.pts = aw.pts.max(state.pts);
+        let sc = self.map
             .entry(Entry::SecretChats)
             // AccountWide affects SecretChats, but this may not have been initialized yet (#258)
             .or_insert_with(|| State {
                 pts: NO_PTS,
                 deadline: next_updates_deadline(),
-            })
-            .pts = state.qts;
-        self.date = state.date;
-        self.seq = state.seq;
+            });
+        sc.pts = sc.pts.max(state.qts);
+        self.date = self.date.max(state.date);
+        self.seq = self.seq.max(state.seq);
 
         // other_updates can contain things like UpdateChannelTooLong and UpdateNewChannelMessage.
         // We need to process those as if they were socket updates to discard any we have already handled.
@@ -869,6 +853,9 @@ impl MessageBox {
         let (mut result_updates, users, chats) = self
             .process_updates(us, chat_hashes)
             .expect("gap is detected while applying difference");
+
+        // Filter out messages already delivered via socket during getDifference
+        let new_messages = self.filter_already_delivered(&Entry::AccountWide, new_messages);
 
         result_updates.extend(
             new_messages
