@@ -40,13 +40,13 @@ pub(super) const USER_CHANNEL_DIFF_LIMIT: i32 = 100;
 /// Documentation recommends 15 minutes without updates (https://core.telegram.org/api/updates).
 pub(super) const NO_UPDATES_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-/// After how long without updates the client will poll a channel via getChannelDifference.
-///
-/// For large broadcast channels (100k+ subscribers), Telegram may not push individual
-/// UpdateNewChannelMessage via socket. Instead, the client must periodically call
-/// getChannelDifference. This timeout controls how frequently that polling happens.
-/// A shorter value means faster delivery for channels that don't receive socket pushes.
-pub(super) const CHANNEL_NO_UPDATES_TIMEOUT: Duration = Duration::from_millis(100);
+/// Default polling interval for unwatched channels.
+/// Uses the standard recommended timeout — these channels receive socket pushes normally.
+pub(super) const CHANNEL_NO_UPDATES_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Polling interval for watched channels (set via `watch_channel`).
+/// Aggressive polling for large broadcast channels that don't receive socket pushes.
+pub(super) const WATCHED_CHANNEL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// A [`MessageBox`] entry key.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -104,6 +104,10 @@ pub struct MessageBox {
     /// Message IDs delivered via socket while getDifference was in progress for a channel.
     /// Used to deduplicate against getDifference results (which may include the same messages).
     pub(super) delivered_during_diff: HashMap<Entry, HashSet<i32>>,
+
+    /// Channel IDs that should be polled aggressively (every WATCHED_CHANNEL_TIMEOUT).
+    /// All other channels use CHANNEL_NO_UPDATES_TIMEOUT (standard 15-min interval).
+    pub(super) watched_channels: HashSet<i64>,
 }
 
 /// Represents the information needed to correctly handle a specific `tl::enums::Update`.

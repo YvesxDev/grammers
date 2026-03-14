@@ -67,7 +67,41 @@ impl MessageBox {
             tmp_entries: HashSet::new(),
             pending_during_diff: HashMap::new(),
             delivered_during_diff: HashMap::new(),
+            watched_channels: HashSet::new(),
         }
+    }
+
+    /// Returns the appropriate deadline for a channel based on whether it's watched.
+    fn channel_deadline(&self, channel_id: i64) -> Instant {
+        if self.watched_channels.contains(&channel_id) {
+            Instant::now() + defs::WATCHED_CHANNEL_TIMEOUT
+        } else {
+            next_channel_updates_deadline()
+        }
+    }
+
+    /// Returns the appropriate deadline for any entry.
+    fn deadline_for(&self, entry: &Entry) -> Instant {
+        match entry {
+            Entry::Channel(id) => self.channel_deadline(*id),
+            _ => next_updates_deadline(),
+        }
+    }
+
+    /// Mark a channel for aggressive polling (100ms interval).
+    /// Only watched channels are polled frequently; all others use the standard 15-min interval.
+    pub fn watch_channel(&mut self, channel_id: i64) {
+        info!("watching channel {} for aggressive polling", channel_id);
+        self.watched_channels.insert(channel_id);
+        // Reset deadline to the aggressive interval immediately
+        if let Some(state) = self.map.get_mut(&Entry::Channel(channel_id)) {
+            state.deadline = Instant::now() + defs::WATCHED_CHANNEL_TIMEOUT;
+        }
+    }
+
+    /// Stop aggressively polling a channel. It will revert to the standard interval.
+    pub fn unwatch_channel(&mut self, channel_id: i64) {
+        self.watched_channels.remove(&channel_id);
     }
 
     /// Create a [`MessageBox`] from a previously known update state.
@@ -99,6 +133,8 @@ impl MessageBox {
             getting_diff_for.insert(Entry::SecretChats);
         }
 
+        // Use the default channel deadline on load; watched channels will get
+        // their aggressive deadline once watch_channel() is called after load.
         let channel_deadline = next_channel_updates_deadline();
         map.extend(state.channels.iter().map(|ChannelStateEnum::State(c)| {
             (
@@ -115,9 +151,8 @@ impl MessageBox {
         // multi-second latency. Any truly missed messages during
         // downtime are already too old to be actionable.
         info!(
-            "MessageBox loaded: {} channels tracked, channel poll interval = {}s",
+            "MessageBox loaded: {} channels tracked (call watch_channel to enable aggressive polling)",
             state.channels.len(),
-            defs::CHANNEL_NO_UPDATES_TIMEOUT.as_secs()
         );
 
         Self {
@@ -130,6 +165,7 @@ impl MessageBox {
             tmp_entries: HashSet::new(),
             pending_during_diff: HashMap::new(),
             delivered_during_diff: HashMap::new(),
+            watched_channels: HashSet::new(),
         }
     }
 
@@ -325,12 +361,17 @@ impl MessageBox {
 
     /// Convenience to reset a channel's deadline, with optional timeout.
     fn reset_channel_deadline(&mut self, channel_id: i64, timeout: Option<i32>) {
+        let default_timeout = if self.watched_channels.contains(&channel_id) {
+            defs::WATCHED_CHANNEL_TIMEOUT
+        } else {
+            defs::CHANNEL_NO_UPDATES_TIMEOUT
+        };
         self.reset_deadline(
             Entry::Channel(channel_id),
             Instant::now()
                 + timeout
                     .map(|t| Duration::from_secs(t as _))
-                    .unwrap_or(defs::CHANNEL_NO_UPDATES_TIMEOUT),
+                    .unwrap_or(default_timeout),
         );
     }
 
@@ -365,9 +406,10 @@ impl MessageBox {
     /// The update state will only be updated if no entry was known previously.
     pub fn try_set_channel_state(&mut self, id: i64, pts: i32) {
         trace!("trying to set channel state for {}: {}", id, pts);
+        let dl = self.channel_deadline(id);
         self.map.entry(Entry::Channel(id)).or_insert_with(|| State {
             pts,
-            deadline: next_channel_updates_deadline(),
+            deadline: dl,
         });
     }
 
@@ -398,11 +440,7 @@ impl MessageBox {
         if !self.getting_diff_for.remove(&entry) {
             panic!("Called end_get_diff on an entry which was not getting diff for");
         };
-        let deadline = if matches!(entry, Entry::Channel(_)) {
-            next_channel_updates_deadline()
-        } else {
-            next_updates_deadline()
-        };
+        let deadline = self.deadline_for(&entry);
         self.reset_deadline(entry, deadline);
 
         // Clean up socket-delivered message ID tracking for this entry
@@ -560,10 +598,16 @@ impl MessageBox {
                 result.push(update);
             }
         }
-        // Split entries by type: channels get a shorter polling deadline.
-        let channel_entries: HashSet<Entry> = reset_deadlines_for
+        // Split entries by type: watched channels get aggressive deadline,
+        // unwatched channels get standard, non-channels get account-wide.
+        let watched: HashSet<Entry> = reset_deadlines_for
             .iter()
-            .filter(|e| matches!(e, Entry::Channel(_)))
+            .filter(|e| matches!(e, Entry::Channel(id) if self.watched_channels.contains(id)))
+            .copied()
+            .collect();
+        let unwatched_channels: HashSet<Entry> = reset_deadlines_for
+            .iter()
+            .filter(|e| matches!(e, Entry::Channel(id) if !self.watched_channels.contains(id)))
             .copied()
             .collect();
         let non_channel_entries: HashSet<Entry> = reset_deadlines_for
@@ -574,8 +618,11 @@ impl MessageBox {
         if !non_channel_entries.is_empty() {
             self.reset_deadlines(&non_channel_entries, next_updates_deadline());
         }
-        if !channel_entries.is_empty() {
-            self.reset_deadlines(&channel_entries, next_channel_updates_deadline());
+        if !unwatched_channels.is_empty() {
+            self.reset_deadlines(&unwatched_channels, next_channel_updates_deadline());
+        }
+        if !watched.is_empty() {
+            self.reset_deadlines(&watched, Instant::now() + defs::WATCHED_CHANNEL_TIMEOUT);
         }
         reset_deadlines_for.clear();
         self.tmp_entries = reset_deadlines_for;
@@ -736,11 +783,7 @@ impl MessageBox {
         // else, there is no previous `pts` known, and because this update has to be "right"
         // (it's the first one) our `local_pts` must be `pts - pts_count`.
 
-        let dl = if matches!(pts.entry, Entry::Channel(_)) {
-            next_channel_updates_deadline()
-        } else {
-            next_updates_deadline()
-        };
+        let dl = self.deadline_for(&pts.entry);
         self.map
             .entry(pts.entry)
             .or_insert_with(|| State {

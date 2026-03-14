@@ -341,6 +341,34 @@ impl Client {
             .session
             .set_state(state.message_box.session_state());
     }
+
+    /// Mark a channel for aggressive polling (100ms interval).
+    ///
+    /// By default, channels use the standard 15-minute polling interval and rely on
+    /// socket pushes for real-time updates. Large broadcast channels (100k+ subscribers)
+    /// may not receive socket pushes, so they need aggressive polling via
+    /// `getChannelDifference` to receive messages promptly.
+    ///
+    /// Only call this for channels you actively monitor — each watched channel generates
+    /// ~10 API requests/second.
+    pub fn watch_channel(&self, channel_id: i64) {
+        self.0
+            .state
+            .write()
+            .unwrap()
+            .message_box
+            .watch_channel(channel_id);
+    }
+
+    /// Stop aggressively polling a channel. Reverts to the standard 15-minute interval.
+    pub fn unwatch_channel(&self, channel_id: i64) {
+        self.0
+            .state
+            .write()
+            .unwrap()
+            .message_box
+            .unwatch_channel(channel_id);
+    }
 }
 
 #[cfg(test)]
