@@ -206,15 +206,14 @@ impl MessageBox {
                     }
                 }));
 
-            // Apply NO_UPDATES_TIMEOUT only to non-channel entries.
-            // Channels deliver updates immediately (even on gap) so getDifference
-            // would only fetch stale messages that cause 10-90s latency.
-            // A quiet channel just means no one posted — not a gap.
+            // Apply NO_UPDATES_TIMEOUT to all entries (including channels).
+            // For large broadcast channels, Telegram may not push individual
+            // UpdateNewChannelMessage at all — instead relying on the client
+            // to call getChannelDifference. Since updates are now always delivered
+            // immediately (never blocked by getDifference), channel getDifference
+            // is safe — it just fills in messages Telegram didn't push via socket.
             self.getting_diff_for
                 .extend(self.map.iter().filter_map(|(entry, state)| {
-                    if matches!(entry, Entry::Channel(_)) {
-                        return None;
-                    }
                     if now >= state.deadline {
                         debug!("too much time has passed without updates for {:?}", entry);
                         Some(entry)
@@ -590,16 +589,19 @@ impl MessageBox {
         if let tl::enums::Update::ChannelTooLong(u) = update {
             let entry = Entry::Channel(u.channel_id);
 
+            // For large broadcast channels, Telegram sends ChannelTooLong instead
+            // of individual message updates. Trigger getDifference to fetch the
+            // actual messages. Since all updates are delivered immediately (never
+            // blocked by getDifference), this won't cause delays for other channels.
             if let Some(remote_pts) = u.pts {
                 if let Some(state) = self.map.get_mut(&entry) {
                     info!(
-                        "ChannelTooLong for {}; fast-forwarding pts from {} to {}",
+                        "ChannelTooLong for {}; triggering getDifference (local pts {}, remote {})",
                         u.channel_id, state.pts, remote_pts
                     );
-                    state.pts = remote_pts;
-                    state.deadline = next_updates_deadline();
                 }
             }
+            self.try_begin_get_diff(entry);
             return (None, None);
         }
 
@@ -663,11 +665,9 @@ impl MessageBox {
                     self.map.get_mut(&pts.entry).unwrap().pts = pts.pts;
 
                     // Trigger getDifference to recover potentially missed updates.
-                    // For channels, skip recovery — gaps are frequent due to high
-                    // volume and getDifference just adds latency.
-                    if !matches!(pts.entry, Entry::Channel(_)) {
-                        self.try_begin_get_diff(pts.entry);
-                    }
+                    // Since updates are always delivered immediately (never blocked
+                    // by getDifference), this is safe for all entries including channels.
+                    self.try_begin_get_diff(pts.entry);
 
                     return (Some(pts.entry), Some(update));
                 }
