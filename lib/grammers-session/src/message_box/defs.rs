@@ -31,7 +31,7 @@ pub(super) const NO_DATE: i32 = 0;
 pub(super) const BOT_CHANNEL_DIFF_LIMIT: i32 = 100000;
 pub(super) const USER_CHANNEL_DIFF_LIMIT: i32 = 100;
 
-/// After how long without updates the client will "timeout".
+/// After how long without updates the client will "timeout" for account-wide entries.
 ///
 /// When this timeout occurs, the client will attempt to fetch updates by itself, ignoring all the
 /// updates that arrive in the meantime. After all updates are fetched when this happens, the
@@ -39,6 +39,14 @@ pub(super) const USER_CHANNEL_DIFF_LIMIT: i32 = 100;
 ///
 /// Documentation recommends 15 minutes without updates (https://core.telegram.org/api/updates).
 pub(super) const NO_UPDATES_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// After how long without updates the client will poll a channel via getChannelDifference.
+///
+/// For large broadcast channels (100k+ subscribers), Telegram may not push individual
+/// UpdateNewChannelMessage via socket. Instead, the client must periodically call
+/// getChannelDifference. This timeout controls how frequently that polling happens.
+/// A shorter value means faster delivery for channels that don't receive socket pushes.
+pub(super) const CHANNEL_NO_UPDATES_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A [`MessageBox`] entry key.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]

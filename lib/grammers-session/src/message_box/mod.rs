@@ -45,6 +45,10 @@ fn next_updates_deadline() -> Instant {
     Instant::now() + defs::NO_UPDATES_TIMEOUT
 }
 
+fn next_channel_updates_deadline() -> Instant {
+    Instant::now() + defs::CHANNEL_NO_UPDATES_TIMEOUT
+}
+
 #[allow(clippy::new_without_default)]
 /// Creation, querying, and setting base state.
 impl MessageBox {
@@ -95,12 +99,13 @@ impl MessageBox {
             getting_diff_for.insert(Entry::SecretChats);
         }
 
+        let channel_deadline = next_channel_updates_deadline();
         map.extend(state.channels.iter().map(|ChannelStateEnum::State(c)| {
             (
                 Entry::Channel(c.channel_id),
                 State {
                     pts: c.pts,
-                    deadline,
+                    deadline: channel_deadline,
                 },
             )
         }));
@@ -291,7 +296,7 @@ impl MessageBox {
             Instant::now()
                 + timeout
                     .map(|t| Duration::from_secs(t as _))
-                    .unwrap_or(defs::NO_UPDATES_TIMEOUT),
+                    .unwrap_or(defs::CHANNEL_NO_UPDATES_TIMEOUT),
         );
     }
 
@@ -328,7 +333,7 @@ impl MessageBox {
         trace!("trying to set channel state for {}: {}", id, pts);
         self.map.entry(Entry::Channel(id)).or_insert_with(|| State {
             pts,
-            deadline: next_updates_deadline(),
+            deadline: next_channel_updates_deadline(),
         });
     }
 
@@ -359,7 +364,12 @@ impl MessageBox {
         if !self.getting_diff_for.remove(&entry) {
             panic!("Called end_get_diff on an entry which was not getting diff for");
         };
-        self.reset_deadline(entry, next_updates_deadline());
+        let deadline = if matches!(entry, Entry::Channel(_)) {
+            next_channel_updates_deadline()
+        } else {
+            next_updates_deadline()
+        };
+        self.reset_deadline(entry, deadline);
 
         // Clean up socket-delivered message ID tracking for this entry
         self.delivered_during_diff.remove(&entry);
@@ -516,7 +526,23 @@ impl MessageBox {
                 result.push(update);
             }
         }
-        self.reset_deadlines(&reset_deadlines_for, next_updates_deadline());
+        // Split entries by type: channels get a shorter polling deadline.
+        let channel_entries: HashSet<Entry> = reset_deadlines_for
+            .iter()
+            .filter(|e| matches!(e, Entry::Channel(_)))
+            .copied()
+            .collect();
+        let non_channel_entries: HashSet<Entry> = reset_deadlines_for
+            .iter()
+            .filter(|e| !matches!(e, Entry::Channel(_)))
+            .copied()
+            .collect();
+        if !non_channel_entries.is_empty() {
+            self.reset_deadlines(&non_channel_entries, next_updates_deadline());
+        }
+        if !channel_entries.is_empty() {
+            self.reset_deadlines(&channel_entries, next_channel_updates_deadline());
+        }
         reset_deadlines_for.clear();
         self.tmp_entries = reset_deadlines_for;
 
@@ -676,11 +702,16 @@ impl MessageBox {
         // else, there is no previous `pts` known, and because this update has to be "right"
         // (it's the first one) our `local_pts` must be `pts - pts_count`.
 
+        let dl = if matches!(pts.entry, Entry::Channel(_)) {
+            next_channel_updates_deadline()
+        } else {
+            next_updates_deadline()
+        };
         self.map
             .entry(pts.entry)
             .or_insert_with(|| State {
                 pts: NO_PTS,
-                deadline: next_updates_deadline(),
+                deadline: dl,
             })
             .pts = pts.pts;
 
