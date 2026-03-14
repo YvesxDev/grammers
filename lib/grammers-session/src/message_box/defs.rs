@@ -46,7 +46,7 @@ pub(super) const NO_UPDATES_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// UpdateNewChannelMessage via socket. Instead, the client must periodically call
 /// getChannelDifference. This timeout controls how frequently that polling happens.
 /// A shorter value means faster delivery for channels that don't receive socket pushes.
-pub(super) const CHANNEL_NO_UPDATES_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const CHANNEL_NO_UPDATES_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A [`MessageBox`] entry key.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
