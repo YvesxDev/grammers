@@ -114,6 +114,11 @@ impl MessageBox {
         // so getDifference would only dump stale messages that cause
         // multi-second latency. Any truly missed messages during
         // downtime are already too old to be actionable.
+        info!(
+            "MessageBox loaded: {} channels tracked, channel poll interval = {}s",
+            state.channels.len(),
+            defs::CHANNEL_NO_UPDATES_TIMEOUT.as_secs()
+        );
 
         Self {
             map,
@@ -178,6 +183,38 @@ impl MessageBox {
     pub fn check_deadlines(&mut self) -> Instant {
         let now = Instant::now();
 
+        // Always check channel deadlines, even while account-wide getDifference
+        // is in progress. Large broadcast channels need their own getDifference
+        // polling and shouldn't be blocked by account-wide recovery.
+        let mut added_channels = false;
+        for (entry, state) in self.map.iter() {
+            if matches!(entry, Entry::Channel(_))
+                && now >= state.deadline
+                && !self.getting_diff_for.contains(entry)
+            {
+                info!("channel {:?} deadline expired, triggering getDifference", entry);
+                added_channels = true;
+            }
+        }
+        if added_channels {
+            // Collect expired channel entries (can't mutate during iteration above)
+            let expired_channels: Vec<Entry> = self
+                .map
+                .iter()
+                .filter_map(|(entry, state)| {
+                    if matches!(entry, Entry::Channel(_))
+                        && now >= state.deadline
+                        && !self.getting_diff_for.contains(entry)
+                    {
+                        Some(*entry)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            self.getting_diff_for.extend(expired_channels);
+        }
+
         if !self.getting_diff_for.is_empty() {
             return now;
         }
@@ -212,11 +249,8 @@ impl MessageBox {
                 }));
 
             // Apply NO_UPDATES_TIMEOUT to all entries (including channels).
-            // For large broadcast channels, Telegram may not push individual
-            // UpdateNewChannelMessage at all — instead relying on the client
-            // to call getChannelDifference. Since updates are now always delivered
-            // immediately (never blocked by getDifference), channel getDifference
-            // is safe — it just fills in messages Telegram didn't push via socket.
+            // Channels were already checked above, but non-channel entries
+            // still need checking here.
             self.getting_diff_for
                 .extend(self.map.iter().filter_map(|(entry, state)| {
                     if now >= state.deadline {
@@ -987,6 +1021,13 @@ impl MessageBox {
             })
             .collect();
 
+        if !channel_entries.is_empty() {
+            info!(
+                "get_all_channel_differences: {} channels pending getDifference",
+                channel_entries.len()
+            );
+        }
+
         let mut requests = Vec::new();
         let mut missing_hash_entries = Vec::new();
 
@@ -1000,6 +1041,10 @@ impl MessageBox {
                 }
                 .into();
                 if let Some(state) = self.map.get(&entry) {
+                    info!(
+                        "requesting getChannelDifference for channel {} (pts = {})",
+                        id, state.pts
+                    );
                     let gd = tl::functions::updates::GetChannelDifference {
                         force: false,
                         channel,
@@ -1011,7 +1056,6 @@ impl MessageBox {
                             defs::USER_CHANNEL_DIFF_LIMIT
                         },
                     };
-                    trace!("requesting {:?}", gd);
                     requests.push(gd);
                 }
             } else {
@@ -1082,9 +1126,26 @@ impl MessageBox {
         chat_hashes: &mut ChatHashCache,
     ) -> defs::UpdateAndPeers {
         let channel_id = channel_id(&request).expect("request had wrong input channel");
-        trace!(
-            "applying channel difference for {}: {:?}",
-            channel_id, difference
+        let diff_type = match &difference {
+            tl::enums::updates::ChannelDifference::Empty(_) => "Empty",
+            tl::enums::updates::ChannelDifference::TooLong(d) => {
+                info!(
+                    "channel {} getDifference returned TooLong ({} messages)",
+                    channel_id, d.messages.len()
+                );
+                "TooLong"
+            }
+            tl::enums::updates::ChannelDifference::Difference(d) => {
+                info!(
+                    "channel {} getDifference returned {} new messages, {} other updates (final={})",
+                    channel_id, d.new_messages.len(), d.other_updates.len(), d.r#final
+                );
+                "Difference"
+            }
+        };
+        debug!(
+            "applying channel difference for {} (type={})",
+            channel_id, diff_type
         );
         let entry = Entry::Channel(channel_id);
 
