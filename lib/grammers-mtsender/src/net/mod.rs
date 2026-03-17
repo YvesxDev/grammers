@@ -26,6 +26,11 @@ pub enum ServerAddr {
     Ws { address: String },
     #[cfg(all(
         not(all(target_arch = "wasm32", target_os = "unknown")),
+        feature = "websocket"
+    ))]
+    Ws { address: String },
+    #[cfg(all(
+        not(all(target_arch = "wasm32", target_os = "unknown")),
         feature = "proxy"
     ))]
     Proxied {

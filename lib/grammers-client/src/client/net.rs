@@ -55,8 +55,23 @@ const WS_ADDRESSES: [&str; 6] = [
     "wss://flora.web.telegram.org/apiws",
 ];
 
+/// WebSocket addresses for native targets (same endpoints as Telegram Web).
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    feature = "websocket"
+))]
+const WS_ADDRESSES: [&str; 6] = [
+    "",
+    "wss://pluto.web.telegram.org/apiws",
+    "wss://venus.web.telegram.org/apiws",
+    "wss://aurora.web.telegram.org/apiws",
+    "wss://vesta.web.telegram.org/apiws",
+    "wss://flora.web.telegram.org/apiws",
+];
+
+// Use TransportMode for runtime selection between Full (TCP) and Obfuscated<Intermediate> (WS).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) type Transport = transport::Full;
+pub(crate) type Transport = transport::TransportMode;
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub(crate) type Transport = transport::Obfuscated<transport::Intermediate>;
@@ -67,12 +82,6 @@ pub(crate) async fn connect_sender(
     dc_id: i32,
     config: &Config,
 ) -> Result<(Sender<Transport, mtp::Encrypted>, Enqueuer), AuthorizationError> {
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    let transport = transport::Full::new();
-
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    let transport = transport::Obfuscated::new(transport::Intermediate::new());
-
     let addr: ServerAddr = if let Some(ref sa) = config.params.server_addr {
         sa.clone()
     } else {
@@ -103,6 +112,28 @@ pub(crate) async fn connect_sender(
 
         addr
     };
+
+    // Select transport based on connection type.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    let transport = {
+        #[cfg(feature = "websocket")]
+        {
+            if matches!(addr, ServerAddr::Ws { .. }) {
+                transport::TransportMode::ObfuscatedIntermediate(
+                    transport::Obfuscated::new(transport::Intermediate::new()),
+                )
+            } else {
+                transport::TransportMode::Full(transport::Full::new())
+            }
+        }
+        #[cfg(not(feature = "websocket"))]
+        {
+            transport::TransportMode::Full(transport::Full::new())
+        }
+    };
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    let transport = transport::Obfuscated::new(transport::Intermediate::new());
 
     let (mut sender, request_tx) = if let Some(auth_key) = config.session.dc_auth_key(dc_id) {
         info!(
@@ -136,6 +167,18 @@ pub(crate) async fn connect_sender(
                 config
                     .session
                     .insert_dc_tcp(dc_id, address, sender.auth_key());
+            }
+            #[cfg(all(
+                not(all(target_arch = "wasm32", target_os = "unknown")),
+                feature = "websocket"
+            ))]
+            ServerAddr::Ws { .. } => {
+                // For WebSocket on native, store the auth key using the TCP DC address
+                // as the session key. The auth key itself is transport-independent.
+                let tcp_addr = DC_ADDRESSES[dc_id as usize].into();
+                config
+                    .session
+                    .insert_dc_tcp(dc_id, &tcp_addr, sender.auth_key());
             }
             #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
             ServerAddr::Ws { ref address } => {

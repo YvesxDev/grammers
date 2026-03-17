@@ -7,33 +7,68 @@
 // except according to those terms.
 
 use log::info;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-pub use tokio::net::tcp::{ReadHalf, WriteHalf};
 
 use super::ServerAddr;
+
+#[cfg(feature = "websocket")]
+use futures_util::{Sink, Stream};
+
+/// Wraps a WebSocket connection to provide AsyncRead + AsyncWrite over binary messages.
+#[cfg(feature = "websocket")]
+pub(crate) struct WsByteStream {
+    ws: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<TcpStream>,
+    >,
+    read_buf: Vec<u8>,
+    read_pos: usize,
+}
+
+pub type ReadHalf<'a> = tokio::io::ReadHalf<&'a mut NetStream>;
+pub type WriteHalf<'a> = tokio::io::WriteHalf<&'a mut NetStream>;
 
 pub enum NetStream {
     Tcp(TcpStream),
     #[cfg(feature = "proxy")]
     ProxySocks5(tokio_socks::tcp::Socks5Stream<TcpStream>),
+    #[cfg(feature = "websocket")]
+    WebSocket(WsByteStream),
 }
 
 impl NetStream {
-    pub(crate) fn split(&mut self) -> (ReadHalf, WriteHalf) {
-        match self {
-            Self::Tcp(stream) => stream.split(),
-            #[cfg(feature = "proxy")]
-            Self::ProxySocks5(stream) => stream.split(),
-        }
+    pub(crate) fn split(&mut self) -> (ReadHalf<'_>, WriteHalf<'_>) {
+        tokio::io::split(self)
     }
 
-    pub(crate) async fn connect(addr: &ServerAddr) -> Result<Self, std::io::Error> {
+    pub(crate) async fn connect(addr: &ServerAddr) -> Result<Self, io::Error> {
         info!("connecting...");
         match addr {
             ServerAddr::Tcp { address } => Ok(NetStream::Tcp(TcpStream::connect(address).await?)),
             #[cfg(feature = "proxy")]
             ServerAddr::Proxied { address, proxy } => {
                 Self::connect_proxy_stream(address, proxy).await
+            }
+            #[cfg(feature = "websocket")]
+            ServerAddr::Ws { address } => {
+                info!("connecting via WebSocket to {}", address);
+                let (ws_stream, _) = tokio_tungstenite::connect_async(address)
+                    .await
+                    .map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            format!("WebSocket connection failed: {}", e),
+                        )
+                    })?;
+                info!("WebSocket connected successfully");
+                Ok(NetStream::WebSocket(WsByteStream {
+                    ws: ws_stream,
+                    read_buf: Vec::new(),
+                    read_pos: 0,
+                }))
             }
         }
     }
@@ -42,7 +77,7 @@ impl NetStream {
     async fn connect_proxy_stream(
         addr: &std::net::SocketAddr,
         proxy_url: &str,
-    ) -> Result<NetStream, std::io::Error> {
+    ) -> Result<NetStream, io::Error> {
         use std::{
             io::{self, ErrorKind},
             net::{IpAddr, SocketAddr},
@@ -104,6 +139,137 @@ impl NetStream {
                 ErrorKind::ConnectionAborted,
                 format!("proxy scheme not supported: {}", scheme),
             )),
+        }
+    }
+}
+
+// Implement AsyncRead for NetStream, dispatching to inner stream type.
+impl AsyncRead for NetStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            NetStream::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            #[cfg(feature = "proxy")]
+            NetStream::ProxySocks5(stream) => Pin::new(stream).poll_read(cx, buf),
+            #[cfg(feature = "websocket")]
+            NetStream::WebSocket(ws) => ws.poll_read_ws(cx, buf),
+        }
+    }
+}
+
+// Implement AsyncWrite for NetStream, dispatching to inner stream type.
+impl AsyncWrite for NetStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            NetStream::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(feature = "proxy")]
+            NetStream::ProxySocks5(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(feature = "websocket")]
+            NetStream::WebSocket(ws) => ws.poll_write_ws(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            NetStream::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(feature = "proxy")]
+            NetStream::ProxySocks5(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(feature = "websocket")]
+            NetStream::WebSocket(ws) => {
+                Pin::new(&mut ws.ws)
+                    .poll_flush(cx)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            }
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            NetStream::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            #[cfg(feature = "proxy")]
+            NetStream::ProxySocks5(stream) => Pin::new(stream).poll_shutdown(cx),
+            #[cfg(feature = "websocket")]
+            NetStream::WebSocket(ws) => {
+                Pin::new(&mut ws.ws)
+                    .poll_close(cx)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl WsByteStream {
+    /// Read bytes from the WebSocket. Binary messages are buffered and served byte-by-byte.
+    fn poll_read_ws(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // Return buffered data from a previous WebSocket message first.
+        if self.read_pos < self.read_buf.len() {
+            let n = std::cmp::min(buf.remaining(), self.read_buf.len() - self.read_pos);
+            buf.put_slice(&self.read_buf[self.read_pos..self.read_pos + n]);
+            self.read_pos += n;
+            if self.read_pos >= self.read_buf.len() {
+                self.read_buf.clear();
+                self.read_pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        // Poll for the next WebSocket message.
+        match Pin::new(&mut self.ws).poll_next(cx) {
+            Poll::Ready(Some(Ok(msg))) => {
+                let data = msg.into_data();
+                if data.is_empty() {
+                    // Empty message (ping/pong/close) — re-poll.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                let n = std::cmp::min(buf.remaining(), data.len());
+                buf.put_slice(&data[..n]);
+                if n < data.len() {
+                    self.read_buf = data;
+                    self.read_pos = n;
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)))
+            }
+            Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "WebSocket closed",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// Write bytes as a single binary WebSocket message.
+    fn poll_write_ws(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        // Check if the sink is ready to accept a message.
+        match Pin::new(&mut self.ws).poll_ready(cx) {
+            Poll::Ready(Ok(())) => {
+                let msg = tokio_tungstenite::tungstenite::Message::Binary(buf.to_vec().into());
+                match Pin::new(&mut self.ws).start_send(msg) {
+                    Ok(()) => Poll::Ready(Ok(buf.len())),
+                    Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+                }
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+            Poll::Pending => Poll::Pending,
         }
     }
 }

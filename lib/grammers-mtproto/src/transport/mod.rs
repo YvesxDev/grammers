@@ -107,3 +107,33 @@ pub trait Tagged {
     /// changes the internal state to avoid sending the tag again.
     fn init_tag(&mut self) -> [u8; 4];
 }
+
+/// Runtime-selectable transport mode. Supports both TCP (Full) and
+/// WebSocket (Obfuscated<Intermediate>) transports in the same binary.
+pub enum TransportMode {
+    Full(Full),
+    ObfuscatedIntermediate(Obfuscated<Intermediate>),
+}
+
+impl Transport for TransportMode {
+    fn pack(&mut self, buffer: &mut DequeBuffer<u8>) {
+        match self {
+            Self::Full(t) => t.pack(buffer),
+            Self::ObfuscatedIntermediate(t) => t.pack(buffer),
+        }
+    }
+
+    fn unpack(&mut self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error> {
+        match self {
+            Self::Full(t) => t.unpack(buffer),
+            Self::ObfuscatedIntermediate(t) => t.unpack(buffer),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Full(t) => t.reset(),
+            Self::ObfuscatedIntermediate(t) => t.reset(),
+        }
+    }
+}
