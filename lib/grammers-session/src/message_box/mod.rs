@@ -419,13 +419,25 @@ impl MessageBox {
     /// Clears any previous gaps.
     fn try_begin_get_diff(&mut self, entry: Entry) {
         if !self.map.contains_key(&entry) {
-            // Won't actually be able to get difference for this entry if we don't have a pts to start off from.
             if self.possible_gaps.contains_key(&entry) {
                 panic!(
                     "Should not have a possible_gap for an entry {entry:?} not in the state map"
                 );
             }
-            return;
+            // For channel entries (e.g. from updateChannelTooLong), create an entry
+            // with pts=1 so getChannelDifference can proceed. The server will respond
+            // with the channel's current state. Without this, large channel updates
+            // are silently dropped when the MessageBox has no prior state.
+            if let Entry::Channel(id) = entry {
+                info!(
+                    "creating initial state for channel {} to enable getChannelDifference",
+                    id
+                );
+                let dl = self.deadline_for(&entry);
+                self.map.insert(entry, State { pts: 1, deadline: dl });
+            } else {
+                return;
+            }
         }
 
         self.getting_diff_for.insert(entry);
