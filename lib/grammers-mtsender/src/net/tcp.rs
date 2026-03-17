@@ -246,6 +246,7 @@ impl WsByteStream {
                 use tokio_tungstenite::tungstenite::Message;
                 match msg {
                     Message::Binary(data) if !data.is_empty() => {
+                        info!("[ws] received {} bytes", data.len());
                         let n = std::cmp::min(buf.remaining(), data.len());
                         buf.put_slice(&data[..n]);
                         if n < data.len() {
@@ -258,7 +259,8 @@ impl WsByteStream {
                         io::ErrorKind::ConnectionReset,
                         "WebSocket closed by server",
                     ))),
-                    _ => {
+                    other => {
+                        info!("[ws] skipping non-binary message: {:?}", other);
                         // Skip non-binary messages (ping/pong/text/empty) — re-poll.
                         cx.waker().wake_by_ref();
                         Poll::Pending
@@ -280,6 +282,7 @@ impl WsByteStream {
     fn ws_send(&mut self, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
         match Pin::new(&mut self.ws).poll_ready(cx) {
             Poll::Ready(Ok(())) => {
+                info!("[ws] sending {} bytes", data.len());
                 let msg = tokio_tungstenite::tungstenite::Message::Binary(data.to_vec().into());
                 match Pin::new(&mut self.ws).start_send(msg) {
                     Ok(()) => {
