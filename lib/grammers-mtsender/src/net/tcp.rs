@@ -26,6 +26,10 @@ pub(crate) struct WsByteStream {
     >,
     read_buf: Vec<u8>,
     read_pos: usize,
+    /// True until the first write completes. The first write contains the 64-byte
+    /// obfuscated init header prepended to the first transport frame. Telegram's
+    /// WebSocket server expects the init header as a separate WebSocket message.
+    init_sent: bool,
 }
 
 pub type ReadHalf<'a> = tokio::io::ReadHalf<&'a mut NetStream>;
@@ -54,7 +58,6 @@ impl NetStream {
             }
             #[cfg(feature = "websocket")]
             ServerAddr::Ws { address } => {
-                use tokio_tungstenite::tungstenite::http::Request;
                 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
                 info!("connecting via WebSocket to {}", address);
@@ -79,6 +82,7 @@ impl NetStream {
                     ws: ws_stream,
                     read_buf: Vec::new(),
                     read_pos: 0,
+                    init_sent: false,
                 }))
             }
         }
@@ -239,19 +243,27 @@ impl WsByteStream {
         // Poll for the next WebSocket message.
         match Pin::new(&mut self.ws).poll_next(cx) {
             Poll::Ready(Some(Ok(msg))) => {
-                let data = msg.into_data();
-                if data.is_empty() {
-                    // Empty message (ping/pong/close) — re-poll.
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
+                use tokio_tungstenite::tungstenite::Message;
+                match msg {
+                    Message::Binary(data) if !data.is_empty() => {
+                        let n = std::cmp::min(buf.remaining(), data.len());
+                        buf.put_slice(&data[..n]);
+                        if n < data.len() {
+                            self.read_buf = data.into();
+                            self.read_pos = n;
+                        }
+                        Poll::Ready(Ok(()))
+                    }
+                    Message::Close(_) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "WebSocket closed by server",
+                    ))),
+                    _ => {
+                        // Skip non-binary messages (ping/pong/text/empty) — re-poll.
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
                 }
-                let n = std::cmp::min(buf.remaining(), data.len());
-                buf.put_slice(&data[..n]);
-                if n < data.len() {
-                    self.read_buf = data;
-                    self.read_pos = n;
-                }
-                Poll::Ready(Ok(()))
             }
             Poll::Ready(Some(Err(e))) => {
                 Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)))
@@ -264,23 +276,51 @@ impl WsByteStream {
         }
     }
 
-    /// Write bytes as a single binary WebSocket message.
-    fn poll_write_ws(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        // Check if the sink is ready to accept a message.
+    /// Send a single binary WebSocket message, flushing immediately.
+    fn ws_send(&mut self, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
         match Pin::new(&mut self.ws).poll_ready(cx) {
             Poll::Ready(Ok(())) => {
-                let msg = tokio_tungstenite::tungstenite::Message::Binary(buf.to_vec().into());
+                let msg = tokio_tungstenite::tungstenite::Message::Binary(data.to_vec().into());
                 match Pin::new(&mut self.ws).start_send(msg) {
-                    Ok(()) => Poll::Ready(Ok(buf.len())),
+                    Ok(()) => {
+                        // Flush to ensure data reaches the network immediately.
+                        // If flush is pending, the next poll_next (read) will flush
+                        // via tungstenite's internal write_pending() call.
+                        let _ = Pin::new(&mut self.ws).poll_flush(cx);
+                        Poll::Ready(Ok(data.len()))
+                    }
                     Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
                 }
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
             Poll::Pending => Poll::Pending,
         }
+    }
+
+    /// Write bytes as WebSocket binary messages.
+    ///
+    /// On the first write, the buffer contains the 64-byte obfuscated init header
+    /// prepended to the first encrypted transport frame. Telegram's WebSocket server
+    /// expects the init header as a separate message, so we split the first write:
+    /// send only the 64-byte header and return Ok(64). The sender will then write
+    /// the remaining bytes (the actual transport frame) as a separate message.
+    fn poll_write_ws(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if !self.init_sent && buf.len() > 64 {
+            // Split: send only the 64-byte obfuscated init header.
+            // The sender will call write again with the remaining bytes.
+            let result = self.ws_send(cx, &buf[..64]);
+            if matches!(result, Poll::Ready(Ok(_))) {
+                self.init_sent = true;
+            }
+            return result;
+        }
+        if !self.init_sent {
+            self.init_sent = true;
+        }
+        self.ws_send(cx, buf)
     }
 }
