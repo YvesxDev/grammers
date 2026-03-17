@@ -54,8 +54,19 @@ impl NetStream {
             }
             #[cfg(feature = "websocket")]
             ServerAddr::Ws { address } => {
+                use tokio_tungstenite::tungstenite::http::Request;
+                use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
                 info!("connecting via WebSocket to {}", address);
-                let (ws_stream, _) = tokio_tungstenite::connect_async(address)
+                let mut request = address.as_str().into_client_request().map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidInput, format!("bad WS URL: {}", e))
+                })?;
+                // Telegram requires the "binary" subprotocol — without it the server returns 404.
+                request.headers_mut().insert(
+                    "Sec-WebSocket-Protocol",
+                    "binary".parse().unwrap(),
+                );
+                let (ws_stream, _) = tokio_tungstenite::connect_async(request)
                     .await
                     .map_err(|e| {
                         io::Error::new(
