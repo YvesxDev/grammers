@@ -164,12 +164,13 @@ impl Client {
                                     PrematureEndReason::TemporaryServerIssues,
                                 );
                         }
-                        Err(e) if e.is("CHANNEL_PRIVATE") => {
+                        Err(e) if e.is("CHANNEL_PRIVATE") || e.is("CHANNEL_INVALID") => {
                             log::info!(
-                                "Account is now banned in {} so we can no longer fetch updates from it",
+                                "Cannot fetch updates for channel {} ({})",
                                 channel_id(&request)
                                     .map(|i| i.to_string())
-                                    .unwrap_or_else(|| "empty channel".into())
+                                    .unwrap_or_else(|| "unknown".into()),
+                                if e.is("CHANNEL_PRIVATE") { "private/banned" } else { "invalid" }
                             );
                             self.0
                                 .state
