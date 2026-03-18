@@ -369,6 +369,26 @@ impl Client {
             .message_box
             .unwatch_channel(channel_id);
     }
+
+    /// Seed a channel's update state so that `getChannelDifference` runs on the
+    /// next call to [`Client::next_update`].
+    ///
+    /// Large broadcast channels may not receive real-time socket pushes from
+    /// Telegram's server. Calling this method on startup for each monitored
+    /// channel triggers a one-time `getChannelDifference` that establishes the
+    /// channel's pts. After that, the server should push future updates via
+    /// socket, eliminating the need for continuous polling.
+    ///
+    /// Unlike [`Client::watch_channel`], this does **not** set up recurring
+    /// polling — it is a one-shot subscription.
+    pub fn subscribe_to_channel(&self, channel_id: i64) {
+        self.0
+            .state
+            .write()
+            .unwrap()
+            .message_box
+            .subscribe_to_channel(channel_id);
+    }
 }
 
 #[cfg(test)]

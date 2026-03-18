@@ -104,6 +104,22 @@ impl MessageBox {
         self.watched_channels.remove(&channel_id);
     }
 
+    /// Seed a channel's state and trigger a one-time `getChannelDifference`.
+    ///
+    /// Creates an entry with pts=1 and immediately marks it for getDifference.
+    /// The server will respond with the channel's current state, establishing
+    /// the correct pts. After that, socket pushes should deliver future updates.
+    pub fn subscribe_to_channel(&mut self, channel_id: i64) {
+        let entry = Entry::Channel(channel_id);
+        if self.map.contains_key(&entry) {
+            return; // Already has state, no need to seed
+        }
+        info!("subscribing to channel {} (seeding pts for getChannelDifference)", channel_id);
+        let dl = self.deadline_for(&entry);
+        self.map.insert(entry, State { pts: 1, deadline: dl });
+        self.getting_diff_for.insert(entry);
+    }
+
     /// Create a [`MessageBox`] from a previously known update state.
     pub fn load(state: UpdateState) -> Self {
         trace!("created new message box with state: {:?}", state);
