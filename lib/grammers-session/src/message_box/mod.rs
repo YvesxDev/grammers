@@ -440,20 +440,12 @@ impl MessageBox {
                     "Should not have a possible_gap for an entry {entry:?} not in the state map"
                 );
             }
-            // For channel entries (e.g. from updateChannelTooLong), create an entry
-            // with pts=1 so getChannelDifference can proceed. The server will respond
-            // with the channel's current state. Without this, large channel updates
-            // are silently dropped when the MessageBox has no prior state.
-            if let Entry::Channel(id) = entry {
-                info!(
-                    "creating initial state for channel {} to enable getChannelDifference",
-                    id
-                );
-                let dl = self.deadline_for(&entry);
-                self.map.insert(entry, State { pts: 1, deadline: dl });
-            } else {
-                return;
-            }
+            // Only create entries for channels that were explicitly subscribed/watched.
+            // Creating entries for ALL unknown channels causes a snowball: over time
+            // hundreds of channels accumulate, their 15-min timeouts fire, and their
+            // getChannelDifference catch-ups from pts=1 block watched channel polling.
+            // Explicitly subscribed channels already have map entries via subscribe_to_channel.
+            return;
         }
 
         self.getting_diff_for.insert(entry);
@@ -1083,7 +1075,7 @@ impl MessageBox {
         &mut self,
         chat_hashes: &ChatHashCache,
     ) -> Vec<tl::functions::updates::GetChannelDifference> {
-        let channel_entries: Vec<(Entry, i64)> = self
+        let all_channel_entries: Vec<(Entry, i64)> = self
             .getting_diff_for
             .iter()
             .filter_map(|&entry| match entry {
@@ -1091,6 +1083,22 @@ impl MessageBox {
                 _ => None,
             })
             .collect();
+
+        // Prioritize watched channels: if any watched channels need polling,
+        // only process those. This prevents slow non-watched channel catch-ups
+        // from blocking watched channel polls in join_all.
+        let watched_entries: Vec<(Entry, i64)> = all_channel_entries
+            .iter()
+            .filter(|(_, id)| self.watched_channels.contains(id))
+            .copied()
+            .collect();
+
+        let channel_entries = if !watched_entries.is_empty() {
+            // Defer non-watched channels to next iteration
+            watched_entries
+        } else {
+            all_channel_entries
+        };
 
         if !channel_entries.is_empty() {
             info!(
